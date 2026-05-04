@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 import pandas as pd
 import requests
+from dotenv import load_dotenv
+
 
 
 warnings.filterwarnings("ignore")  # suppress noisy deprecation warnings
