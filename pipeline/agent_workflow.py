@@ -19,12 +19,14 @@ from mongo_store import get_mongo_store
 
 load_dotenv()
 
+# Resolve paths relative to this file so the script works from any cwd
 BASE_DIR = Path(__file__).resolve().parent
 SCREENING_FEATHER = BASE_DIR / "screening_output" / "final_screening_union.feather"
 CHART_MANIFEST_CSV = BASE_DIR / "screening_output" / "chart_manifest.csv"
 AGENTS_DATA_PACKAGE_DIR = BASE_DIR / "agents_data_package"
 OUTPUT_ROOT = BASE_DIR / "output" / "agent_runs"
 
+# Allow overriding the base URL for local proxies or Azure deployments
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
 ANALYST_SYSTEM_PROMPT = """You are a stock analyst evaluating one ticker.
@@ -69,6 +71,7 @@ FINAL_JSON:
 """
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run per-ticker analyst agents.")
+    # Rank range lets you slice the screener output without rerunning the full list
     parser.add_argument(
         "--start-rank",
         type=int,
@@ -81,6 +84,7 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Ending screener rank to analyze.",
     )
+    # Keep max-workers low to avoid rate limits on the API
     parser.add_argument("--max-workers", type=int, default=2, help="Concurrent per-ticker agent calls.")
     parser.add_argument("--model", type=str, default=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"))
     parser.add_argument("--reasoning-effort", type=str, default="low", choices=["low", "medium", "high"])
@@ -110,6 +114,7 @@ def parse_args() -> argparse.Namespace:
         default=1.5,
         help="Skip files larger than this size in MB to reduce context overflows.",
     )
+    # Useful for skipping tickers that consistently cause API errors or timeouts
     parser.add_argument(
         "--skip-tickers",
         type=str,
@@ -134,3 +139,72 @@ def build_run_dirs(run_id: Optional[str]) -> Dict[str, Path]:
     for d in (root, per_stock, charts, uploaded):
         d.mkdir(parents=True, exist_ok=True)
     return {"root": root, "per_stock": per_stock, "charts": charts, "uploaded": uploaded}
+
+
+
+
+#line 395
+# Safe for use in file and directory names
+def sanitize_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+
+
+def make_json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): make_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    # numpy scalars aren't JSON-serializable, but .item() converts them
+    if hasattr(value, "item") and callable(getattr(value, "item")):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def create_session_chart_bundle(run_dirs: Dict[str, Path], selected_rows: List[Dict[str, object]]) -> Dict[str, object]:
+    chart_paths = []
+    # Skip chart lookup entirely if the manifest hasn't been generated yet
+    if CHART_MANIFEST_CSV.exists():
+        chart_df = pd.read_csv(CHART_MANIFEST_CSV)
+        if {"Ticker", "chart_image_path"}.issubset(chart_df.columns):
+            # Normalize to uppercase so ticker matching is case-insensitive
+            chart_df["Ticker"] = chart_df["Ticker"].astype(str).str.upper()
+            selected_tickers = [str(row["Ticker"]).upper() for row in selected_rows]
+            chart_paths = (
+                chart_df[chart_df["Ticker"].isin(selected_tickers)]
+                .sort_values("screen_rank" if "screen_rank" in chart_df.columns else "Ticker")
+                ["chart_image_path"]
+                .dropna()
+                .astype(str)
+                .tolist()
+            )
+
+    pdf_path = run_dirs["charts"] / "selected_screening_charts.pdf"
+    included = []
+    if chart_paths:
+        with PdfPages(pdf_path) as pdf:
+            for chart_path in chart_paths:
+                image_path = Path(chart_path)
+                # Chart may have been deleted or moved since manifest was written
+                if not image_path.exists():
+                    continue
+                img = mpimg.imread(image_path)
+                fig, ax = plt.subplots(figsize=(12, 6))
+                ax.imshow(img)
+                ax.axis("off")
+                fig.tight_layout()
+                pdf.savefig(fig)
+                plt.close(fig)
+                included.append(str(image_path))
+
+    return {
+        "chart_pdf_path": str(pdf_path) if included else "",
+        "chart_image_paths": included,
+    }
+#452
