@@ -38,78 +38,64 @@ The web app allows a user to register, log in, choose a rank range from the scre
 └── README.md
 ```
 
-## Local Setup
+## Live App
 
-1. Clone the repository.
-2. Create and activate a virtual environment.
-3. Install the dependencies for all three subsystems.
-4. Copy `.env.example` to `.env`.
-5. Start MongoDB and run the parts you need.
+The app is deployed and running at:
 
-Example:
+**http://204.48.16.73:5001**
+
+Register an account, then use the dashboard to launch stock screening and analysis jobs.
+
+## Developer Setup
+
+These instructions are for developers who want to run the project locally.
+
+**Prerequisites:** Docker must be installed. Get it at [docs.docker.com/get-docker](https://docs.docker.com/get-docker/).
+
+1. Clone the repository:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r web/requirements.txt
-pip install -r pipeline/requirements.txt
-pip install -r mongo_service/requirements.txt
-pip install pytest pytest-cov
+git clone https://github.com/swe-students-spring2026/5-final-lakers_in_five.git
+cd 5-final-lakers_in_five
+```
+
+2. Copy `.env.example` to `.env` and fill in your values:
+
+```bash
 cp .env.example .env
 ```
 
 ## Environment Variables
 
-Put these values in `.env`:
+Edit `.env` with your real credentials:
 
 ```bash
 OPENAI_API_KEY=your_openai_api_key_here
 SEC_USER_AGENT=YourName your_email@example.com
-MONGODB_URI=mongodb://localhost:27017
+MONGODB_URI=mongodb://mongodb:27017
 MONGODB_DB_NAME=stocks_app
 FLASK_SECRET_KEY=your_random_secret_here
 ```
 
-Optional values:
+See `.env.example` for a full template. `MONGODB_URI` should stay as `mongodb://mongodb:27017` when running with Docker — it points to the MongoDB container.
 
-```bash
-OPENAI_MODEL=gpt-5.4-mini
-OPENAI_WEB_TOOL_TYPE=web_search_preview
-```
+## Running Locally
 
-## Running The Project
-
-Run the stock screener only:
-
-```bash
-python pipeline/stocks.py
-```
-
-Run the analyst workflow only:
-
-```bash
-python pipeline/agent_workflow.py --start-rank 1 --end-rank 3
-```
-
-Run the full pipeline:
-
-```bash
-python pipeline/run_pipeline.py --start-rank 1 --end-rank 3
-```
-
-Run the web app:
-
-```bash
-python web/app.py
-```
-
-Run the full Docker stack:
+**Start the web app and database:**
 
 ```bash
 docker compose up --build
 ```
 
-Import starter pipeline output into MongoDB after generating output:
+The web app will be available at `http://localhost:5001`.
+
+**Run the stock screener pipeline (opt-in):**
+
+```bash
+docker compose --profile pipeline run pipeline
+```
+
+**Import pipeline output into MongoDB:**
 
 ```bash
 docker compose --profile seed up mongo_seed
@@ -117,13 +103,12 @@ docker compose --profile seed up mongo_seed
 
 ## Testing
 
-Run all tests:
-
 ```bash
+pip install pytest pytest-cov
 pytest mongo_service/tests pipeline/tests web/tests
 ```
 
-The CI workflows for `web`, `pipeline`, and `mongo_service` each build, test, and publish their own subsystem independently.
+The CI workflows for `web`, `pipeline`, and `mongo_service` each build, test, and publish their own Docker image independently on every push to main.
 
 ## Generated Output
 
