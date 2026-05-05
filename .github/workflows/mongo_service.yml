@@ -46,12 +46,12 @@ jobs:
           pip install -r mongo_service/requirements.txt
           pip install pytest mongomock pytest-cov
 
-      - name: Run tests with coverage
+      - name: Run mongo service tests with coverage
         env:
           MONGO_URI: mongodb://admin:password@localhost:27017/stocks_db?authSource=admin
           PYTHONPATH: .
         run: |
-          pytest --cov=mongo_service --cov-fail-under=80 -q
+          pytest mongo_service/tests --cov=mongo_service --cov-fail-under=80 -q
 
   publish:
     needs: build
