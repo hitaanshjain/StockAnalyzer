@@ -1,11 +1,26 @@
-# pytest settings that might help... feel free to modify or remove as needed
+# pytest settings
 
 [tool.pytest.ini_options]
-minversion = "7.0" # minimum pytest version
-addopts = "-ra -q" # default pytest command line options
+minversion = "7.0"
+addopts = "-ra -q"
 pythonpath = [
   "."
 ]
 testpaths = [
-    "mongo_service/tests",
+  "mongo_service/tests",
+  "pipeline/tests",
+  "web/tests",
 ]
+
+[tool.coverage.run]
+omit = [
+  "*/tests/*",
+  "pipeline/run_pipeline.py",
+  "pipeline/stocks.py",
+  "pipeline/agent_workflow.py",
+  "web/app.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
