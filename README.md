@@ -69,7 +69,7 @@ docker compose up --build
 
 This builds the local `web` image, starts MongoDB, and launches the Flask app.
 
-The web app will be available at **http://localhost:5001**. Register an account and log in to access the dashboard.
+The web app will be available at **http://localhost:5001**. Register an account and log in to access the dashboard.(If the link gereated on your terminal get access denied - > go to your local 5001)
 
 **4. Stop the app when you are done:**
 
