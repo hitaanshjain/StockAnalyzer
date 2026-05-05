@@ -33,7 +33,7 @@ jobs:
       - name: Run tests
         run: |
           cd web
-          pytest tests/ --cov=. --cov-report=term-missing --cov-fail-under=80
+          pytest tests/ --cov=mongo_store --cov-report=term-missing --cov-fail-under=80
 
       # only push/deploy on actual pushes, not PRs
       - name: Log in to Docker Hub
