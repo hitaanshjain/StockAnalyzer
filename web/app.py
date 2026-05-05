@@ -31,6 +31,7 @@ def create_app() -> Flask:
     app = Flask(__name__)
     app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(16))
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    
 
     store = MongoStore()
     app.config["MONGO_STORE"] = store
@@ -168,5 +169,7 @@ def create_app() -> Flask:
         if "user_id" in session:
             return redirect(url_for("dashboard"))
         return redirect(url_for("login"))
+    return app
+
 
     

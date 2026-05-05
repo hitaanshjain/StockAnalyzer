@@ -143,6 +143,279 @@ def build_run_dirs(run_id: Optional[str]) -> Dict[str, Path]:
 
 
 
+
+def resolve_rank_bounds(total_count: int, start_rank: int, end_rank: int, label: str) -> tuple[int, int]:
+    # Fail fast when there is no ranked universe to slice.
+    if total_count <= 0:
+        raise ValueError(f"No screened stocks are available for {label}.")
+
+    # Clamp the starting rank to at least 1 and log if user input was adjusted.
+    normalized_start = max(1, int(start_rank))
+    if normalized_start != int(start_rank):
+        print(f"{label}: adjusted start rank from {start_rank} to {normalized_start}.")
+
+    # Reject requests that start beyond the available number of screened rows.
+    if normalized_start > total_count:
+        raise ValueError(
+            f"{label}: start rank {normalized_start} exceeds available screened stocks ({total_count})."
+        )
+
+    # Ensure the end rank is not before the start rank, then cap it to the dataset size.
+    normalized_end = max(normalized_start, int(end_rank))
+    if normalized_end > total_count:
+        print(f"{label}: adjusted end rank from {normalized_end} to {total_count}.")
+        normalized_end = total_count
+
+    # Return a safe inclusive rank window for downstream filtering.
+    return normalized_start, normalized_end
+
+
+def load_ranked_tickers(
+    path: Path,
+    start_rank: int,
+    end_rank: int,
+    skip_tickers: Optional[set] = None,
+) -> List[Dict[str, object]]:
+    # The screening output is the source of truth for which tickers can be analyzed.
+    if not path.exists():
+        raise FileNotFoundError(f"Missing screening feather: {path}")
+
+    # Load the feather file into a DataFrame for ranking and filtering.
+    df = pd.read_feather(path)
+    if "Ticker" not in df.columns:
+        raise ValueError("Expected `Ticker` column in final_screening_union.feather.")
+
+    # Prefer the richer combined score when present; otherwise fall back to technical score.
+    if "combined_score" in df.columns:
+        df = df.sort_values("combined_score", ascending=False, kind="stable")
+    elif "technical_score" in df.columns:
+        df = df.sort_values("technical_score", ascending=False, kind="stable")
+
+    # Standardize ticker symbols and remove duplicates before assigning ranks.
+    df = df.dropna(subset=["Ticker"]).copy()
+    df["Ticker"] = df["Ticker"].astype(str).str.upper()
+    df = df.drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
+    df["screen_rank"] = range(1, len(df) + 1)
+
+    # Keep only the requested inclusive rank window.
+    start_rank, end_rank = resolve_rank_bounds(len(df), start_rank, end_rank, label="Analysis range")
+    df = df[(df["screen_rank"] >= start_rank) & (df["screen_rank"] <= end_rank)].copy()
+
+    # Optionally remove user-specified tickers from the analysis batch.
+    if skip_tickers:
+        df = df[~df["Ticker"].isin(skip_tickers)].copy()
+    if df.empty:
+        raise ValueError("No tickers found in screening feather.")
+
+    # Convert the filtered DataFrame into plain dicts for downstream processing.
+    return df.to_dict(orient="records")
+
+
+def list_ticker_package_files(
+    ticker: str,
+    include_feather: bool,
+    max_sec_html_files: int,
+    max_file_size_mb: float,
+) -> List[Path]:
+    # Each ticker gets its own package directory containing the data sent to the analyst agent.
+    root = AGENTS_DATA_PACKAGE_DIR / ticker
+    if not root.exists():
+        raise FileNotFoundError(f"Missing ticker package directory: {root}")
+
+    # Start with the core files that are most useful for the analysis prompt.
+    candidates = [
+        root / "screening_snapshot.json",
+        root / "price_history.csv",
+        root / "price_history.feather",
+        root / "package_meta.json",
+        root / "yahoo" / "fast_info.json",
+        root / "yahoo" / "info_selected.json",
+        root / "yahoo" / "financials.csv",
+        root / "yahoo" / "balance_sheet.csv",
+        root / "yahoo" / "cashflow.csv",
+        root / "yahoo" / "quarterly_financials.csv",
+        root / "yahoo" / "quarterly_balance_sheet.csv",
+        root / "yahoo" / "quarterly_cashflow.csv",
+        root / "sec" / "selected_filings.csv",
+    ]
+    files = [p for p in candidates if p.exists()]
+
+    # Add a limited number of raw SEC filing HTML files, which can be helpful but bulky.
+    sec_html = sorted((root / "sec" / "filings_html").glob("*.htm"))
+    sec_html.extend(sorted((root / "sec" / "filings_html").glob("*.html")))
+    if max_sec_html_files >= 0:
+        sec_html = sec_html[:max_sec_html_files]
+    files.extend(sec_html)
+
+    # Feather files are optional because they can add size without always helping the model.
+    if not include_feather:
+        files = [p for p in files if p.suffix.lower() != ".feather"]
+
+    # Apply a size cap so oversized artifacts do not bloat uploads or exceed context budgets.
+    if max_file_size_mb > 0:
+        max_bytes = int(max_file_size_mb * 1024 * 1024)
+        files = [p for p in files if p.stat().st_size <= max_bytes]
+
+    # Return only files that actually exist and satisfy the inclusion rules.
+    return files
+
+
+def http_post_json(
+    session: requests.Session,
+    url: str,
+    headers: dict,
+    payload: dict,
+    timeout: int = 300,
+    retries: int = 3,
+) -> dict:
+    # Keep track of the last exception so the final error message is informative.
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            # Submit the request and treat HTTP error responses as retryable failures.
+            resp = session.post(url, headers=headers, json=payload, timeout=timeout)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"{resp.status_code} {resp.text}")
+            return resp.json()
+        except Exception as exc:
+            last_err = exc
+            msg = str(exc)
+
+            # Back off more aggressively when the API reports rate limiting.
+            if "429" in msg or "rate_limit_exceeded" in msg:
+                m = re.search(r"Please try again in ([0-9.]+)s", msg)
+                wait_sec = float(m.group(1)) + 1.5 if m else (4.0 * attempt)
+                time.sleep(wait_sec)
+                continue
+
+            # For other transient failures, do a simpler linear backoff before retrying.
+            if attempt < retries:
+                time.sleep(2 * attempt)
+
+    # Surface the most recent failure after all retry attempts are exhausted.
+    raise RuntimeError(f"POST failed after {retries} attempts: {last_err}")
+
+def upload_file(session: requests.Session, api_key: str, file_path: Path, retries: int = 3) -> str:
+    # Track the last error so the final raised message is informative.
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            # Open the file in binary mode and POST it to the OpenAI Files API.
+            with open(file_path, "rb") as f:
+                resp = session.post(
+                    f"{OPENAI_BASE_URL}/files",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    data={"purpose": "user_data"},
+                    files={"file": (file_path.name, f)},
+                    timeout=180,
+                )
+            if resp.status_code >= 400:
+                raise RuntimeError(f"{resp.status_code} {resp.text}")
+            body = resp.json()
+            file_id = body.get("id")
+            # The API should always return an id on success; treat missing id as an error.
+            if not file_id:
+                raise RuntimeError(f"No file id returned for {file_path}")
+            return file_id
+        except Exception as exc:
+            last_err = exc
+            # Wait with linear backoff before the next attempt.
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+    raise RuntimeError(f"File upload failed for {file_path}: {last_err}")
+
+
+def extract_response_text(resp_json: dict) -> str:
+    # Fast path: newer Responses API versions return a top-level output_text field.
+    if isinstance(resp_json.get("output_text"), str) and resp_json["output_text"].strip():
+        return resp_json["output_text"]
+
+    # Fallback: walk the output array and collect all text content blocks.
+    chunks: List[str] = []
+    for item in resp_json.get("output", []) or []:
+        content = item.get("content", []) if isinstance(item, dict) else []
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            # Accept both output_text and plain text block types.
+            if c.get("type") in {"output_text", "text"}:
+                txt = c.get("text", "")
+                if txt:
+                    chunks.append(txt)
+    return "\n\n".join(chunks).strip()
+
+
+def extract_final_json_block(text: str) -> Optional[dict]:
+    # Locate the FINAL_JSON marker that the analyst prompt requires at the end of the response.
+    marker = "FINAL_JSON:"
+    idx = text.find(marker)
+    if idx == -1:
+        return None
+    tail = text[idx + len(marker) :]
+
+    # Find the opening brace of the JSON object.
+    start = tail.find("{")
+    if start == -1:
+        return None
+    snippet = tail[start:]
+
+    # Walk character-by-character to find the matching closing brace,
+    # correctly handling escaped characters inside strings.
+    depth = 0
+    in_str = False
+    esc = False
+    end_pos = None
+    for i, ch in enumerate(snippet):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end_pos = i + 1
+                break
+    if not end_pos:
+        return None
+    raw = snippet[:end_pos]
+    # Parse the extracted JSON; return None if the model produced malformed output.
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def build_analyst_user_prompt(ticker: str, package_files: List[Path]) -> str:
+    # Build a relative path list so the model sees tidy names rather than full filesystem paths.
+    rels = []
+    for p in package_files:
+        try:
+            rels.append(str(p.relative_to(AGENTS_DATA_PACKAGE_DIR / ticker)))
+        except Exception:
+            rels.append(p.name)
+
+    # Format the file list as a bullet manifest embedded in the prompt.
+    manifest = "\n".join(f"- {r}" for r in rels)
+
+    # Return the full user message that instructs the analyst agent on what to produce.
+    return (
+        f"Analyze ticker: {ticker}\n\n"
+        "Use the attached files as primary evidence. Web search is allowed for missing/stale data.\n"
+        "Be explicit about what changed, what is priced in, and expected value.\n\n"
+        "Attached file manifest:\n"
+        f"{manifest}\n\n"
+        "Return the exact required section structure and include FINAL_JSON at the end."
+    )
+#line 360
+  
 #line 395
 # Safe for use in file and directory names
 def sanitize_name(name: str) -> str:
@@ -208,3 +481,4 @@ def create_session_chart_bundle(run_dirs: Dict[str, Path], selected_rows: List[D
         "chart_image_paths": included,
     }
 #452
+

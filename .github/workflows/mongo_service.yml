@@ -1,12 +1,15 @@
 on:
+  workflow_dispatch:
   push:
     branches: [main, master]
     paths:
       - "mongo_service/**"
+      - ".github/workflows/mongo_service.yml"
   pull_request:
     branches: [main, master]
     paths:
       - "mongo_service/**"
+      - ".github/workflows/mongo_service.yml"
 
 jobs:
   build:
@@ -19,7 +22,7 @@ jobs:
       mongodb:
         image: mongo:latest
         options: >-
-          --health-cmd mongosh --eval "db.adminCommand({ ping: 1 })"
+          --health-cmd "mongosh --eval 'db.adminCommand({ ping: 1 })'"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
@@ -43,24 +46,26 @@ jobs:
           pip install -r mongo_service/requirements.txt
           pip install pytest mongomock pytest-cov
 
-      - name: Run tests with coverage
+      - name: Run mongo service tests with coverage
         env:
           MONGO_URI: mongodb://admin:password@localhost:27017/stocks_db?authSource=admin
           PYTHONPATH: .
         run: |
-          pytest --cov=mongo_service --cov-fail-under=80 -q
+          pytest mongo_service/tests --cov=mongo_service --cov-fail-under=80 -q
 
   publish:
     needs: build
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && vars.DOCKERHUB_PUBLISH == 'true'
     steps:
       - uses: actions/checkout@v4
+
       - name: Log in to Docker Hub
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Build and push image
         uses: docker/build-push-action@v4
         with:
