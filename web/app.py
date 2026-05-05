@@ -42,6 +42,8 @@ def create_app() -> Flask:
     app.config["MONGO_STORE"] = store
 
     def mongo_ready() -> bool:
+        if store.db is None:
+            store.connect()
         return store.db is not None
 
     def users_col():
