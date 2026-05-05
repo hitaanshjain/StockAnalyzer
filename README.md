@@ -1,5 +1,8 @@
 # Final Project
 
+![Web CI/CD](https://github.com/swe-students-spring2026/5-final-lakers_in_five/actions/workflows/web.yml/badge.svg)
+![Pipeline CI/CD](https://github.com/swe-students-spring2026/5-final-lakers_in_five/actions/workflows/pipeline.yml/badge.svg)
+
 This project is a stock screening and analysis application built for our software engineering final project. The system screens U.S. stocks using market momentum and insider-buying activity, builds research packages for selected tickers, and then runs an AI-based analyst workflow to generate writeups for the strongest names.
 
 The project has three main parts:
