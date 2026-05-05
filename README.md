@@ -125,6 +125,10 @@ pytest mongo_service/tests pipeline/tests web/tests
 
 The CI workflows for `web`, `pipeline`, and `mongo_service` each build, test, and publish their own subsystem independently.
 
+## Live Analysis Note
+
+If an error appears in the live analysis output while a run is in progress, it is usually a scraping or upstream data-fetch issue rather than a problem with the overall web app. In most cases this does not mean the whole system is broken, and it is generally safe to rerun the analysis.
+
 ## Generated Output
 
 Generated runtime output is not intended to be committed:
