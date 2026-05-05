@@ -85,6 +85,717 @@ def download_nasdaq_symbol_dirs() -> Tuple[pd.DataFrame, pd.DataFrame]:
     return pd.read_csv(io.StringIO(nasdaq_txt), sep="|"), pd.read_csv(io.StringIO(other_txt), sep="|")
     lookback_months: int = 8
 
+def quadratic_log_fit_r2(price_series: pd.Series) -> Tuple[float, float]:
+    s = pd.Series(price_series).dropna().copy()
+    if len(s) < 5:
+        return np.nan, np.nan
+    if (s <= 0).any():
+        return np.nan, np.nan
+
+    y = np.log(s.values)
+    t = np.arange(len(y))
+    c_quad, b_quad, a_quad = np.polyfit(t, y, 2)
+    y_hat = a_quad + b_quad * t + c_quad * (t ** 2)
+    ss_res = np.sum((y - y_hat) ** 2)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    r2 = np.nan if ss_tot == 0 else 1 - ss_res / ss_tot
+    return float(c_quad), float(r2)
+
+
+def analyze_one_stock(series: pd.Series, cfg: PipelineConfig) -> Optional[dict]:
+    s = pd.to_numeric(pd.Series(series), errors="coerce").dropna().copy()
+    if len(s) < cfg.min_trading_days:
+        return None
+    if s.iloc[0] <= 0 or s.iloc[-1] <= 0:
+        return None
+
+    start_price = float(s.iloc[0])
+    end_price = float(s.iloc[-1])
+    total_return_pct = (end_price / start_price - 1) * 100
+    if total_return_pct < cfg.min_return_pct:
+        return None
+    if end_price < cfg.min_last_price:
+        return None
+
+    # The script scores "is the trend getting cleaner and steeper lately?" by comparing
+    # the older half of the chart to the recent half, not by fitting one model to the
+    # whole period and hoping that tells the story.
+    n = len(s)
+    mid = n // 2
+    old_s = s.iloc[:mid].copy()
+    recent_s = s.iloc[mid:].copy()
+
+    if len(old_s) < 20 or len(recent_s) < 20:
+        return None
+    if (old_s <= 0).any() or (recent_s <= 0).any():
+        return None
+
+    x_old = np.arange(len(old_s))
+    y_old = np.log(old_s.to_numpy(dtype=float))
+    reg_old = linregress(x_old, y_old)
+    old_log_slope = float(reg_old.slope)
+    old_r2 = float(reg_old.rvalue ** 2)
+    old_tnr = trend_to_noise_ratio(old_s)
+
+    x_recent = np.arange(len(recent_s))
+    y_recent = np.log(recent_s.to_numpy(dtype=float))
+    reg_recent = linregress(x_recent, y_recent)
+    recent_log_slope = float(reg_recent.slope)
+    recent_r2 = float(reg_recent.rvalue ** 2)
+    recent_tnr = trend_to_noise_ratio(recent_s)
+
+    if recent_r2 < cfg.min_recent_r2:
+        return None
+    if recent_log_slope <= 0:
+        return None
+
+    # Ratios are clipped on purpose so one weird denominator does not blow up the ranking.
+    r2_ratio = safe_ratio(recent_r2, old_r2, cfg.ratio_clip_min, cfg.ratio_clip_max)
+    slope_ratio = safe_ratio(recent_log_slope, max(old_log_slope, cfg.ratio_clip_min), cfg.ratio_clip_min, cfg.ratio_clip_max)
+    tnr_ratio = safe_ratio(recent_tnr, old_tnr, cfg.ratio_clip_min, cfg.ratio_clip_max)
+
+    technical_score = (
+        cfg.weight_r2_ratio * r2_ratio
+        + cfg.weight_slope_ratio * slope_ratio
+        + cfg.weight_tnr_ratio * tnr_ratio
+    )
+
+    quadratic_c_curvature, quadratic_r2 = quadratic_log_fit_r2(s)
+
+    return {
+        "n_days": len(s),
+        "start_price": start_price,
+        "end_price": end_price,
+        "total_return_pct": total_return_pct,
+        "technical_score": float(technical_score),
+        "recent_r2_old_r2_ratio": r2_ratio,
+        "recent_r2": recent_r2,
+        "old_r2": old_r2,
+        "recent_tnr_old_tnr_ratio": tnr_ratio,
+        "recent_tnr": recent_tnr,
+        "old_tnr": old_tnr,
+        "recent_log_slope": recent_log_slope,
+        "old_log_slope": old_log_slope,
+        "recent_log_slope_old_log_slope_ratio": slope_ratio,
+        "quadratic_c_curvature": quadratic_c_curvature,
+        "quadratic_r2": quadratic_r2,
+    }
+
+
+def _clean_colname(col: str) -> str:
+    return str(col).strip().replace("\xa0", " ").replace("\n", " ").replace("\r", " ")
+
+
+def _to_float(x) -> float:
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    if s in {"", "-", "nan", "None"}:
+        return np.nan
+    s = s.replace("$", "").replace(",", "").replace("%", "").replace("+", "")
+    s = s.replace("(", "-").replace(")", "")
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
+
+
+def _extract_trade_code(val: str) -> Optional[str]:
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    return s.split(" - ")[0].strip().upper()
+
+
+def clean_numeric_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        s.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.replace("+", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.replace("(", "-", regex=False)
+        .str.replace(")", "", regex=False)
+        .str.strip(),
+        errors="coerce",
+    )
+
+
+def parse_openinsider_table_from_html(html: str, ticker: str) -> pd.DataFrame:
+    try:
+        tables = pd.read_html(io.StringIO(html))
+    except Exception:
+        return pd.DataFrame()
+    if len(tables) == 0:
+        return pd.DataFrame()
+
+    df = max(tables, key=lambda x: x.shape[1]).copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [" ".join([str(x) for x in col if str(x) != "nan"]).strip() for col in df.columns]
+    else:
+        df.columns = [str(c) for c in df.columns]
+    df.columns = [re.sub(r"\s+", " ", str(c).replace("\xa0", " ")).strip() for c in df.columns]
+
+    rename_map = {}
+    for c in df.columns:
+        cl = c.lower()
+        if "filing" in cl and "date" in cl:
+            rename_map[c] = "filing_date"
+        elif "trade" in cl and "date" in cl:
+            rename_map[c] = "trade_date"
+        elif cl == "ticker":
+            rename_map[c] = "Ticker"
+        elif "insider name" in cl or cl == "insider":
+            rename_map[c] = "insider_name"
+        elif "trade type" in cl or "trade code" in cl:
+            rename_map[c] = "trade_code"
+        elif cl == "title":
+            rename_map[c] = "title"
+        elif cl in {"price", "qty", "owned", "value"}:
+            rename_map[c] = cl
+    df = df.rename(columns=rename_map)
+
+    if "Ticker" not in df.columns:
+        df["Ticker"] = ticker
+    df["Ticker"] = df["Ticker"].astype(str).str.upper().str.strip()
+    df = df[df["Ticker"] == ticker.upper()].copy()
+
+    for c in ["filing_date", "trade_date"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+    for c in ["value", "qty", "price", "owned"]:
+        if c in df.columns:
+            df[c] = clean_numeric_series(df[c])
+    if "trade_code" in df.columns:
+        df["trade_code"] = (
+            df["trade_code"].astype(str).str.replace("\xa0", " ", regex=False).str.replace(r"\s+", " ", regex=True).str.upper().str.strip()
+        )
+    if "insider_name" in df.columns:
+        df["insider_name"] = (
+            df["insider_name"].astype(str).str.replace("\xa0", " ", regex=False).str.replace(r"\s+", " ", regex=True).str.strip()
+        )
+    return df
+
+
+def fetch_openinsider_ticker_table(ticker: str, timeout: int = 20) -> pd.DataFrame:
+    url = f"http://openinsider.com/search?q={ticker}"
+    headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"}
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return parse_openinsider_table_from_html(resp.text, ticker=ticker)
+
+
+def is_purchase_row(row: pd.Series) -> bool:
+    if "trade_code" not in row.index or pd.isna(row["trade_code"]):
+        return False
+    return str(row["trade_code"]).upper().strip().startswith("P")
+
+
+def summarize_insider(df: pd.DataFrame, lookback_days: int, market_cap: float) -> dict:
+    base = {
+        "buy_dollars_60d": 0.0,
+        "unique_buyers_60d": 0,
+        "insider_score_60d": 0.0,
+        "n_insider_rows": 0,
+    }
+    if df is None or df.empty:
+        return base
+    date_col = "trade_date" if "trade_date" in df.columns else "filing_date"
+    if date_col not in df.columns:
+        return base
+    cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=lookback_days)
+    df = df[df[date_col] >= cutoff].copy()
+    if df.empty:
+        return base
+
+    buys = df[df.apply(is_purchase_row, axis=1)].copy() if "trade_code" in df.columns else pd.DataFrame(columns=df.columns)
+    if "value" in buys.columns:
+        buys["value"] = pd.to_numeric(buys["value"], errors="coerce").fillna(0)
+        buy_dollars = float(buys["value"].sum())
+    else:
+        buy_dollars = 0.0
+    if "insider_name" in buys.columns:
+        unique_buyers = int(buys["insider_name"].dropna().astype(str).str.strip().nunique())
+    else:
+        unique_buyers = 0
+    # This is a homemade score, not a finance-standard metric. It rewards more dollars
+    # and more distinct buyers, but uses log1p so one giant trade does not dominate everything.
+    insider_score = math.log1p(max(buy_dollars, 0)) * (1 + 0.25 * unique_buyers)
+    return {
+        "buy_dollars_60d": buy_dollars,
+        "unique_buyers_60d": unique_buyers,
+        "insider_score_60d": float(insider_score),
+        "n_insider_rows": int(len(df)),
+    }
+
+
+def build_screen(universe_meta: pd.DataFrame, price_long: pd.DataFrame, cfg: PipelineConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    target_start = pd.Timestamp.now().normalize() - pd.DateOffset(months=cfg.lookback_months)
+    price_wide = (
+        price_long.pivot(index="date", columns="Ticker", values="close")
+        .sort_index()
+        .loc[lambda x: x.index >= target_start]
+    )
+    screen_meta = universe_meta[
+        (universe_meta["market_cap_num"] >= cfg.universe_min_market_cap)
+        & (universe_meta["market_cap_num"] <= cfg.screen_max_market_cap)
+    ].copy()
+    tickers = sorted(set(price_wide.columns).intersection(set(screen_meta["Ticker"])))
+
+    rows = []
+    for ticker in tickers:
+        stats = analyze_one_stock(price_wide[ticker], cfg)
+        if stats is None:
+            continue
+        stats["Ticker"] = ticker
+        rows.append(stats)
+    ranked = pd.DataFrame(rows)
+    if ranked.empty:
+        return ranked, price_wide
+    ranked = ranked.merge(screen_meta[["Ticker", "Company", "sector", "industry", "market_cap_num"]], on="Ticker", how="left")
+    ranked["score_r2"] = ranked["recent_r2"]
+    return (
+        ranked.sort_values(
+            by=["technical_score", "recent_r2", "recent_log_slope", "total_return_pct"],
+            ascending=False,
+        ).reset_index(drop=True),
+        price_wide,
+    )
+
+
+def add_insider_scores(ranked_df: pd.DataFrame, cfg: PipelineConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if ranked_df.empty:
+        return ranked_df, pd.DataFrame()
+    candidate_tickers = ranked_df["Ticker"].dropna().astype(str).str.upper().tolist()
+    market_cap_map = (
+        ranked_df[["Ticker", "market_cap_num"]]
+        .dropna(subset=["Ticker"])
+        .drop_duplicates(subset=["Ticker"])
+        .set_index("Ticker")["market_cap_num"]
+        .to_dict()
+    )
+
+    def _fetch_one(ticker: str):
+        try:
+            raw_local = fetch_openinsider_ticker_table(ticker=ticker, timeout=cfg.insider_timeout_sec)
+        except Exception:
+            raw_local = pd.DataFrame()
+        summary_local = summarize_insider(
+            raw_local,
+            cfg.insider_lookback_days,
+            float(market_cap_map.get(ticker, np.nan)) if pd.notna(market_cap_map.get(ticker, np.nan)) else np.nan,
+        )
+        summary_local["Ticker"] = ticker
+        return raw_local, summary_local
+
+    raw_rows = []
+    summary_rows = []
+    max_workers = max(1, int(cfg.insider_max_workers))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_fetch_one, ticker) for ticker in candidate_tickers]
+        for future in as_completed(futures):
+            raw, summary = future.result()
+            if not raw.empty:
+                raw_rows.append(raw)
+            summary_rows.append(summary)
+
+    insider_raw_df = pd.concat(raw_rows, ignore_index=True) if raw_rows else pd.DataFrame()
+    insider_summary_df = pd.DataFrame(summary_rows)
+    merged = ranked_df.merge(insider_summary_df, on="Ticker", how="left")
+    for c in ["buy_dollars_60d", "unique_buyers_60d", "insider_score_60d", "n_insider_rows"]:
+        if c in merged.columns:
+            merged[c] = merged[c].fillna(0)
+    merged["combined_score"] = (
+        0.65 * merged["technical_score"].rank(pct=True).fillna(0)
+        + 0.35 * merged["insider_score_60d"].rank(pct=True).fillna(0)
+    )
+    merged = merged.sort_values(["combined_score", "technical_score"], ascending=False).reset_index(drop=True)
+    return merged, insider_raw_df
+
+
+def build_insider_summary_for_tickers(
+    candidate_tickers: List[str], cfg: PipelineConfig, market_cap_map: Optional[dict] = None
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    market_cap_map = market_cap_map or {}
+    tickers = sorted({str(t).strip().upper() for t in candidate_tickers if str(t).strip()})
+
+    def _fetch_one(ticker: str):
+        try:
+            raw_local = fetch_openinsider_ticker_table(ticker=ticker, timeout=cfg.insider_timeout_sec)
+        except Exception:
+            raw_local = pd.DataFrame()
+        cap = market_cap_map.get(ticker, np.nan)
+        summary_local = summarize_insider(
+            raw_local,
+            cfg.insider_lookback_days,
+            float(cap) if pd.notna(cap) else np.nan,
+        )
+        summary_local["Ticker"] = ticker
+        return raw_local, summary_local
+
+    raw_rows = []
+    summary_rows = []
+    max_workers = max(1, int(cfg.insider_max_workers))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_fetch_one, ticker) for ticker in tickers]
+        with tqdm(total=len(futures), desc="Insider scrape", unit="ticker") as pbar:
+            for future in as_completed(futures):
+                raw, summary = future.result()
+                if not raw.empty:
+                    raw_rows.append(raw)
+                summary_rows.append(summary)
+                pbar.update(1)
+
+    insider_raw_df = pd.concat(raw_rows, ignore_index=True) if raw_rows else pd.DataFrame()
+    insider_summary_df = pd.DataFrame(summary_rows)
+    if insider_summary_df.empty:
+        insider_summary_df = pd.DataFrame({"Ticker": tickers})
+    for c in [
+        "buy_dollars_60d",
+        "unique_buyers_60d",
+        "insider_score_60d",
+        "n_insider_rows",
+    ]:
+        if c not in insider_summary_df.columns:
+            insider_summary_df[c] = 0.0
+        insider_summary_df[c] = insider_summary_df[c].fillna(0)
+    insider_summary_df = insider_summary_df.sort_values(
+        by=["insider_score_60d", "buy_dollars_60d", "unique_buyers_60d"], ascending=False
+    ).reset_index(drop=True)
+    return insider_summary_df, insider_raw_df
+
+
+def _dedupe_insider_raw(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "Ticker" in out.columns:
+        out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
+    if "trade_date" in out.columns:
+        out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce")
+    dedupe_cols = [c for c in ["Ticker", "trade_date", "insider_name", "trade_type", "price", "qty", "value"] if c in out.columns]
+    if dedupe_cols:
+        out = out.drop_duplicates(subset=dedupe_cols, keep="last")
+    else:
+        out = out.drop_duplicates(keep="last")
+    return out.reset_index(drop=True)
+
+
+def update_insider_cache(
+    candidate_tickers: List[str], cfg: PipelineConfig, market_cap_map: Optional[dict] = None, force_refresh: bool = False
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    latest_market_day = get_latest_market_trading_day()
+    tickers = sorted({str(t).strip().upper() for t in candidate_tickers if str(t).strip()})
+    market_cap_map = market_cap_map or {}
+
+    cached_summary = load_feather(INSIDER_SUMMARY_FEATHER)
+    cached_raw = load_feather(INSIDER_FEATHER)
+
+    if not force_refresh and cached_summary is not None and not cached_summary.empty and "insider_asof_date" in cached_summary.columns:
+        cached_summary["insider_asof_date"] = pd.to_datetime(cached_summary["insider_asof_date"], errors="coerce").dt.normalize()
+        latest_asof = cached_summary["insider_asof_date"].max()
+        cached_tickers = set(cached_summary["Ticker"].dropna().astype(str).str.upper())
+        missing = sorted(set(tickers) - cached_tickers)
+
+        if pd.notna(latest_asof) and latest_asof >= latest_market_day and not missing:
+            print(
+                f"Insider cache up-to-date (asof {latest_asof.date()}, market day {latest_market_day.date()}); using cache."
+            )
+            summary = cached_summary[cached_summary["Ticker"].isin(tickers)].drop_duplicates(subset=["Ticker"]).copy()
+            raw = pd.DataFrame()
+            if cached_raw is not None and not cached_raw.empty and "Ticker" in cached_raw.columns:
+                raw = cached_raw[cached_raw["Ticker"].astype(str).str.upper().isin(tickers)].copy()
+            return summary, raw
+
+        if pd.notna(latest_asof) and latest_asof >= latest_market_day and missing:
+            # Same idea as metadata: if today's cache is good but incomplete, only scrape the missing names.
+            print(f"Insider cache up-to-date but missing {len(missing)} ticker(s); fetching only missing.")
+            fresh_summary, fresh_raw = build_insider_summary_for_tickers(missing, cfg, market_cap_map)
+            fresh_summary["insider_asof_date"] = latest_market_day
+            merged_summary = pd.concat([cached_summary, fresh_summary], ignore_index=True)
+            merged_summary = merged_summary.sort_values("insider_asof_date").drop_duplicates(subset=["Ticker"], keep="last")
+
+            merged_raw = pd.DataFrame() if cached_raw is None else cached_raw.copy()
+            if fresh_raw is not None and not fresh_raw.empty:
+                merged_raw = _dedupe_insider_raw(pd.concat([merged_raw, fresh_raw], ignore_index=True))
+
+            save_feather(merged_summary, INSIDER_SUMMARY_FEATHER)
+            save_feather(merged_raw, INSIDER_FEATHER)
+            out_summary = merged_summary[merged_summary["Ticker"].isin(tickers)].copy()
+            out_raw = pd.DataFrame()
+            if not merged_raw.empty and "Ticker" in merged_raw.columns:
+                out_raw = merged_raw[merged_raw["Ticker"].astype(str).str.upper().isin(tickers)].copy()
+            return out_summary, out_raw
+
+    if force_refresh:
+        print("Forced insider refresh requested.")
+    else:
+        print("Insider cache stale or missing; fetching and merging latest insider data.")
+
+    fresh_summary, fresh_raw = build_insider_summary_for_tickers(tickers, cfg, market_cap_map)
+    fresh_summary["insider_asof_date"] = latest_market_day
+
+    merged_summary = fresh_summary.copy()
+    if cached_summary is not None and not cached_summary.empty:
+        merged_summary = pd.concat([cached_summary, fresh_summary], ignore_index=True)
+        if "insider_asof_date" in merged_summary.columns:
+            merged_summary["insider_asof_date"] = pd.to_datetime(
+                merged_summary["insider_asof_date"], errors="coerce"
+            ).dt.normalize()
+            merged_summary = merged_summary.sort_values("insider_asof_date")
+        merged_summary = merged_summary.drop_duplicates(subset=["Ticker"], keep="last")
+    merged_summary = merged_summary.reset_index(drop=True)
+
+    merged_raw = _dedupe_insider_raw(fresh_raw)
+    if cached_raw is not None and not cached_raw.empty:
+        merged_raw = _dedupe_insider_raw(pd.concat([cached_raw, fresh_raw], ignore_index=True))
+
+    save_feather(merged_summary, INSIDER_SUMMARY_FEATHER)
+    save_feather(merged_raw, INSIDER_FEATHER)
+    out_summary = merged_summary[merged_summary["Ticker"].isin(tickers)].copy()
+    out_raw = pd.DataFrame()
+    if not merged_raw.empty and "Ticker" in merged_raw.columns:
+        out_raw = merged_raw[merged_raw["Ticker"].astype(str).str.upper().isin(tickers)].copy()
+    return out_summary, out_raw
+
+
+def build_screening_union_df(
+    technical_df: pd.DataFrame, insider_ranked_df: pd.DataFrame, universe_meta: pd.DataFrame, insider_threshold: float
+) -> pd.DataFrame:
+    if technical_df is None or technical_df.empty or "Ticker" not in technical_df.columns:
+        technical_enriched = pd.DataFrame(columns=["Ticker"])
+    else:
+        already_has = {"buy_dollars_60d", "unique_buyers_60d", "insider_score_60d", "n_insider_rows"}.issubset(
+            set(technical_df.columns)
+        )
+        if already_has:
+            technical_enriched = technical_df.copy()
+        else:
+            technical_enriched = technical_df.merge(
+                insider_ranked_df[
+                    [
+                        "Ticker",
+                        "buy_dollars_60d",
+                        "unique_buyers_60d",
+                        "insider_score_60d",
+                        "n_insider_rows",
+                    ]
+                ],
+                on="Ticker",
+                how="left",
+            )
+    insider_only = insider_ranked_df[insider_ranked_df["insider_score_60d"] > insider_threshold].copy()
+    insider_only = insider_only.merge(
+        universe_meta[["Ticker", "Company", "sector", "industry", "market_cap_num"]],
+        on="Ticker",
+        how="left",
+    )
+
+    final_df = pd.concat([technical_enriched, insider_only], ignore_index=True, sort=False)
+    # Final list is the union of:
+    # 1) names that passed the technical screen
+    # 2) names with unusually strong insider buying, even if they missed the chart screen
+    final_df["from_technical_screen"] = final_df["technical_score"].notna() if "technical_score" in final_df.columns else False
+    final_df["from_insider_threshold"] = final_df["insider_score_60d"].fillna(0) > insider_threshold
+    final_df = final_df.sort_values(
+        by=["from_technical_screen", "insider_score_60d", "technical_score", "total_return_pct"],
+        ascending=False,
+    ).drop_duplicates(subset=["Ticker"], keep="first")
+    final_df = final_df.reset_index(drop=True)
+    return final_df
+
+
+def merge_insider_data(base_df: pd.DataFrame, insider_summary_df: pd.DataFrame) -> pd.DataFrame:
+    merged = base_df.merge(insider_summary_df, on="Ticker", how="left")
+    for c in ["buy_dollars_60d", "unique_buyers_60d", "insider_score_60d", "n_insider_rows"]:
+        if c in merged.columns:
+            merged[c] = merged[c].fillna(0)
+    return merged
+
+
+def add_normalized_scores(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    out["technical_score_norm"] = out["technical_score"].rank(pct=True)
+    out["insider_score_norm"] = out["insider_score_60d"].rank(pct=True)
+    out["combined_score"] = 0.65 * out["technical_score_norm"] + 0.35 * out["insider_score_norm"]
+    return out
+
+
+def validate_insider_coverage(df: pd.DataFrame, min_ratio: float) -> None:
+    if df is None or df.empty:
+        raise RuntimeError("Combined dataframe is empty; cannot validate insider coverage.")
+    if "insider_score_60d" not in df.columns:
+        raise RuntimeError("Missing insider_score_60d column in combined dataframe.")
+    total = len(df)
+    covered = int(df["insider_score_60d"].notna().sum())
+    ratio = covered / total if total > 0 else 0
+    if ratio < min_ratio:
+        raise RuntimeError(
+            f"Insider coverage too low: {covered}/{total} ({ratio:.1%}) < required {min_ratio:.1%}. "
+            "This indicates insider fetch/cache issue; refusing to continue."
+        )
+
+
+def rank_screening_df(final_df: pd.DataFrame) -> pd.DataFrame:
+    out = final_df.copy()
+    sort_cols = [c for c in ["combined_score", "technical_score", "insider_score_60d", "total_return_pct"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(by=sort_cols, ascending=False).reset_index(drop=True)
+    else:
+        out = out.reset_index(drop=True)
+    out["screen_rank"] = np.arange(1, len(out) + 1)
+    return out
+
+
+def select_rank_range(final_df: pd.DataFrame, start_rank: int = 1, end_rank: Optional[int] = None) -> pd.DataFrame:
+    ranked = final_df.copy()
+    if "screen_rank" not in ranked.columns:
+        ranked = rank_screening_df(ranked)
+    start_rank = max(1, int(start_rank))
+    end_rank = int(end_rank) if end_rank is not None else int(ranked["screen_rank"].max())
+    end_rank = max(start_rank, end_rank)
+    return ranked[(ranked["screen_rank"] >= start_rank) & (ranked["screen_rank"] <= end_rank)].copy()
+
+
+def resolve_rank_bounds(total_count: int, start_rank: int, end_rank: Optional[int], label: str) -> Tuple[int, int]:
+    if total_count <= 0:
+        raise ValueError(f"No screened stocks are available for {label}.")
+
+    normalized_start = max(1, int(start_rank))
+    if normalized_start != int(start_rank):
+        print(f"{label}: adjusted start rank from {start_rank} to {normalized_start}.")
+
+    if normalized_start > total_count:
+        raise ValueError(
+            f"{label}: start rank {normalized_start} exceeds available screened stocks ({total_count})."
+        )
+
+    normalized_end = total_count if end_rank is None else max(normalized_start, int(end_rank))
+    if normalized_end > total_count:
+        print(f"{label}: adjusted end rank from {normalized_end} to {total_count}.")
+        normalized_end = total_count
+
+    return normalized_start, normalized_end
+
+
+def _build_chart_figure(row: pd.Series, price_wide: pd.DataFrame, cfg: PipelineConfig):
+    target_start = pd.Timestamp.now().normalize() - pd.DateOffset(months=cfg.lookback_months)
+    ticker = str(row["Ticker"]).upper()
+    if ticker not in price_wide.columns:
+        return None
+    s = pd.to_numeric(price_wide[ticker], errors="coerce").dropna()
+    s = s[s.index >= target_start]
+    if len(s) < max(20, cfg.min_trading_days):
+        return None
+    if (s <= 0).any():
+        return None
+
+    n = len(s)
+    mid = n // 2
+    old_s = s.iloc[:mid].copy()
+    recent_s = s.iloc[mid:].copy()
+    if len(old_s) < 5 or len(recent_s) < 5:
+        return None
+
+    log_s = np.log(s.to_numpy(dtype=float))
+
+    x_old = np.arange(len(old_s))
+    y_old = np.log(old_s.values)
+    reg_old = linregress(x_old, y_old)
+    yhat_old = reg_old.intercept + reg_old.slope * x_old
+
+    x_recent = np.arange(len(recent_s))
+    y_recent = np.log(recent_s.values)
+    reg_recent = linregress(x_recent, y_recent)
+    yhat_recent = reg_recent.intercept + reg_recent.slope * x_recent
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(s.index, log_s, label="Actual log-price", linewidth=2)
+    ax.plot(old_s.index, yhat_old, label=f"Old-half fit | slope={reg_old.slope:.5f}, R2={reg_old.rvalue**2:.3f}", linewidth=2)
+    ax.plot(recent_s.index, yhat_recent, label=f"Recent-half fit | slope={reg_recent.slope:.5f}, R2={reg_recent.rvalue**2:.3f}", linewidth=2)
+    ax.axvline(s.index[mid], linestyle="--", alpha=0.7, label="Split point")
+    ax.grid(True, alpha=0.3)
+    insider_score = row.get("insider_score_60d", np.nan)
+    buy_dollars = row.get("buy_dollars_60d", np.nan)
+    unique_buyers = row.get("unique_buyers_60d", np.nan)
+    insider_txt = "MISSING" if pd.isna(insider_score) else f"{float(insider_score):.2f}"
+    buy_txt = "MISSING" if pd.isna(buy_dollars) else f"{float(buy_dollars):,.0f}"
+    ub_txt = "MISSING" if pd.isna(unique_buyers) else f"{int(unique_buyers)}"
+    title = (
+        f"{ticker} | Rank={int(row.get('screen_rank', -1))} | Combined={row.get('combined_score', np.nan):.3f} | "
+        f"Tech={row.get('technical_score', np.nan):.3f} | "
+        f"Insider={insider_txt} | Buy$60d={buy_txt} | UniqueBuyers={ub_txt}"
+    )
+    ax.set_title(title)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Log Price")
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def build_chart_images_for_screening(
+    final_df: pd.DataFrame, price_wide: pd.DataFrame, cfg: PipelineConfig, output_dir: Path
+) -> pd.DataFrame:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    ranked = rank_screening_df(final_df)
+    for _, row in ranked.iterrows():
+        fig = _build_chart_figure(row, price_wide, cfg)
+        if fig is None:
+            continue
+        ticker = str(row["Ticker"]).upper()
+        image_path = output_dir / f"{int(row['screen_rank']):03d}_{ticker}.png"
+        fig.savefig(image_path, dpi=160)
+        plt.close(fig)
+        rows.append(
+            {
+                "Ticker": ticker,
+                "screen_rank": int(row["screen_rank"]),
+                "chart_image_path": str(image_path),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_chart_pdf_for_screening(
+    final_df: pd.DataFrame,
+    price_wide: pd.DataFrame,
+    cfg: PipelineConfig,
+    output_pdf: Path,
+    start_rank: int = 1,
+    end_rank: Optional[int] = None,
+) -> pd.DataFrame:
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+    ranked = select_rank_range(final_df, start_rank=start_rank, end_rank=end_rank)
+    included_rows = []
+    with PdfPages(output_pdf) as pdf:
+        for _, row in ranked.iterrows():
+            fig = _build_chart_figure(row, price_wide, cfg)
+            if fig is None:
+                continue
+            included_rows.append({"Ticker": str(row["Ticker"]).upper(), "screen_rank": int(row["screen_rank"])})
+            pdf.savefig(fig)
+            plt.close(fig)
+    return pd.DataFrame(included_rows)
+
+
+def _safe_filename(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(text))
+
+
+def _json_safe(val):
+    if isinstance(val, (np.floating, np.integer)):
+        return val.item()
+    if isinstance(val, (pd.Timestamp, np.datetime64)):
+        return str(pd.Timestamp(val))
+    if pd.isna(val):
+        return None
+    return val
 
 #remove 1135
 def _sec_headers() -> dict:

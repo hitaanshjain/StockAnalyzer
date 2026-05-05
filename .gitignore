@@ -124,6 +124,12 @@ ENV/
 env.bak/
 venv.bak/
 
+# Generated market data caches and outputs
+data/
+output/
+screening_output/
+agents_data_package/
+
 # Spyder project settings
 .spyderproject
 .spyproject
