@@ -9,9 +9,7 @@ services:
       - mongo_data:/data/db
 
   web:
-    build:
-      context: .
-      dockerfile: web/Dockerfile
+    image: ${DOCKERHUB_USERNAME}/stocks-web:latest
     ports:
       - "5001:5000"
     env_file:
