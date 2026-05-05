@@ -14,21 +14,21 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import requests
-from dotenv import load_dotenv
 import yfinance as yf
-import numpy as np
 import matplotlib.pyplot as plt
+from dotenv import load_dotenv
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy.stats import linregress
 from tqdm.auto import tqdm
 from yahooquery import Ticker
+
 from mongo_store import get_mongo_store
 
-
-warnings.filterwarnings("ignore")  # suppress noisy deprecation warnings
-load_dotenv()  # pull in .env vars so we don't have to hardcode credentials
+warnings.filterwarnings("ignore")
+load_dotenv()
 
 
 @dataclass
@@ -36,35 +36,35 @@ class PipelineConfig:
     # This is basically the script's control panel. Most of the "why did it do that?"
     # questions trace back to one of these thresholds or cache TTLs.
     universe_history_years: int = 3
-    universe_min_market_cap: float = 100e6   # $100M floor to skip micro-caps
-    universe_max_market_cap: float = 50e9   # $50B ceiling — true small/mid only
+    universe_min_market_cap: float = 100e6
+    universe_max_market_cap: float = 50e9
     screen_max_market_cap: float = 10e9
-    lookback_months: int = 8               # how far back we look at price history
-    min_return_pct: float = 30.0           # must be up at least 30% over lookback
+    lookback_months: int = 8
+    min_return_pct: float = 30.0
     min_trading_days: int = 80
-    min_last_price: float = 1.0            # filter out penny stocks
-    min_recent_r2: float = 0.85            # trend must be fairly linear
+    min_last_price: float = 1.0
+    min_recent_r2: float = 0.85
     weight_r2_ratio: float = 0.50
     weight_slope_ratio: float = 0.30
     weight_tnr_ratio: float = 0.20
     ratio_clip_min: float = 0.05
     ratio_clip_max: float = 10.0
-    meta_chunk_size: int = 150             # batch size for metadata fetches
+    meta_chunk_size: int = 150
     meta_sleep_sec: float = 0.05
     meta_max_workers: int = 4
-    metadata_refresh_days: int = 7         # re-download metadata once a week
+    metadata_refresh_days: int = 7
     download_chunk_size: int = 100
     price_sleep_sec: float = 0.02
-    insider_lookback_days: int = 60        # look at last 2 months of insider filings
+    insider_lookback_days: int = 60
     insider_score_threshold: float = 25.0
     insider_max_workers: int = 8
     insider_timeout_sec: int = 12
     min_insider_coverage_ratio: float = 0.95
     package_max_workers: int = 6
-    package_refresh_days: int = 60         # refresh agent data packages monthly
-    sec_min_interval_sec: float = 0.12     # rate-limit SEC requests to stay polite
+    package_refresh_days: int = 60
+    sec_min_interval_sec: float = 0.12
     sec_timeout_sec: int = 30
-    sec_num_8k: int = 10                   # number of recent 8-K filings to pull
+    sec_num_8k: int = 10
 
 #folder paths
 BASE_DIR = Path(__file__).resolve().parent
@@ -89,8 +89,8 @@ def download_nasdaq_symbol_dirs() -> Tuple[pd.DataFrame, pd.DataFrame]:
     other_url = "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
     nasdaq_txt = requests.get(nasdaq_url, timeout=30).text
     other_txt = requests.get(other_url, timeout=30).text
-    # both files are pipe-delimited; parse them into dataframes and return as a pair
     return pd.read_csv(io.StringIO(nasdaq_txt), sep="|"), pd.read_csv(io.StringIO(other_txt), sep="|")
+
 #uses the previous funciton to get all the data, then builds a clean dataframe which is now the "stock universe"
 def build_us_common_stock_universe() -> pd.DataFrame:
     nasdaq_df, other_df = download_nasdaq_symbol_dirs()
@@ -205,25 +205,20 @@ def fetch_yahoo_metadata(
     meta["market_cap_num"] = pd.to_numeric(meta["market_cap_num"], errors="coerce")
     meta["regularMarketPrice"] = pd.to_numeric(meta["regularMarketPrice"], errors="coerce")
     return meta
+
+
 def update_metadata_cache(raw_universe: pd.DataFrame, cfg: PipelineConfig, force_refresh: bool = False) -> pd.DataFrame:
-    """Return universe metadata from cache when fresh, backfilling only missing tickers when needed."""
-    # Normalize "today" so age checks are done in whole days, not wall-clock hours.
     today = pd.Timestamp.now().normalize()
-    # Canonical ticker format prevents case/whitespace mismatches during cache joins.
     tickers = raw_universe["Ticker"].dropna().astype(str).str.upper().tolist()
     cached = load_feather(META_FEATHER)
 
-    # Fast path: only use cache when refresh is not forced and required cache fields are present.
     if (not force_refresh) and cached is not None and not cached.empty and "meta_asof_date" in cached.columns:
-        # Coerce dates defensively so malformed rows don't break freshness checks.
         cached["meta_asof_date"] = pd.to_datetime(cached["meta_asof_date"], errors="coerce").dt.normalize()
         latest_asof = cached["meta_asof_date"].max()
         cached_tickers = set(cached["Ticker"].dropna().astype(str).str.upper())
-        # Treat missing/invalid asof dates as very old so we refresh safely.
         age_days = (today - latest_asof).days if pd.notna(latest_asof) else 99999
         missing = sorted(set(tickers) - cached_tickers)
 
-        # Cache is fresh and complete for requested tickers.
         if age_days <= cfg.metadata_refresh_days and not missing:
             print(
                 f"Metadata cache age {age_days} day(s) <= {cfg.metadata_refresh_days}; "
@@ -232,7 +227,7 @@ def update_metadata_cache(raw_universe: pd.DataFrame, cfg: PipelineConfig, force
             return cached[cached["Ticker"].isin(tickers)].drop_duplicates(subset=["Ticker"]).copy()
 
         if age_days <= cfg.metadata_refresh_days and missing:
-            # Cache is still fresh but missing some tickers; fetch only gaps to avoid unnecessary Yahoo requests.
+            # Fresh cache, incomplete coverage. Fill only the holes instead of hammering Yahoo again.
             print(
                 f"Metadata cache is fresh ({age_days} day(s)) but missing {len(missing)} ticker(s); "
                 "fetching only missing metadata."
@@ -244,13 +239,11 @@ def update_metadata_cache(raw_universe: pd.DataFrame, cfg: PipelineConfig, force
                 max_workers=cfg.meta_max_workers,
             )
             if not meta_missing.empty:
-                # Stamp new rows, merge, and keep newest record per ticker.
                 meta_missing["meta_asof_date"] = today
                 merged = pd.concat([cached, meta_missing], ignore_index=True)
                 merged = merged.sort_values("meta_asof_date").drop_duplicates(subset=["Ticker"], keep="last")
                 save_feather(merged, META_FEATHER)
                 return merged[merged["Ticker"].isin(tickers)].drop_duplicates(subset=["Ticker"]).copy()
-            # If Yahoo returns nothing for missing symbols, keep serving the cached subset.
             return cached[cached["Ticker"].isin(tickers)].drop_duplicates(subset=["Ticker"]).copy()
 
     if force_refresh:
@@ -258,7 +251,6 @@ def update_metadata_cache(raw_universe: pd.DataFrame, cfg: PipelineConfig, force
     else:
         print(f"Metadata cache stale; refreshing full metadata for {len(tickers)} tickers.")
 
-    # Slow path: refresh full metadata snapshot and overwrite cache.
     meta = fetch_yahoo_metadata(
         tickers,
         chunk_size=cfg.meta_chunk_size,
@@ -273,9 +265,7 @@ def update_metadata_cache(raw_universe: pd.DataFrame, cfg: PipelineConfig, force
 def download_close_prices_long(
     tickers: List[str], start_date: str, end_date: str, chunk_size: int = 100, sleep_sec: float = 0.02
 ) -> pd.DataFrame:
-    """Download daily adjusted close prices in chunks and return normalized long-format rows."""
     long_frames = []
-    # Download in chunks to reduce request size and transient Yahoo failures.
     for i, chunk in enumerate(chunk_list(tickers, chunk_size), start=1):
         print(f"Price chunk {i}: {len(chunk)}")
         try:
@@ -292,11 +282,9 @@ def download_close_prices_long(
         except Exception as exc:
             print(f"  Price failure: {exc}")
             continue
-        # Skip empty payloads and continue with remaining chunks.
         if data is None or data.empty:
             continue
 
-        # MultiIndex is the normal shape for multi-ticker downloads.
         if isinstance(data.columns, pd.MultiIndex):
             for ticker in chunk:
                 if ticker not in data.columns.get_level_values(0):
@@ -310,7 +298,6 @@ def download_close_prices_long(
                 df["Ticker"] = ticker
                 long_frames.append(df[["date", "Ticker", "close"]])
         else:
-            # Single ticker downloads can come back as a flat column frame.
             if len(chunk) == 1 and "Close" in data.columns:
                 s = data["Close"].dropna()
                 if not s.empty:
@@ -318,31 +305,25 @@ def download_close_prices_long(
                     df["Ticker"] = chunk[0]
                     long_frames.append(df[["date", "Ticker", "close"]])
         if sleep_sec > 0:
-            # Optional throttle to stay friendly with upstream endpoints.
             time.sleep(sleep_sec)
 
     if not long_frames:
-        # Preserve schema for downstream joins/pivots even when no data was fetched.
         return pd.DataFrame(columns=["date", "Ticker", "close"])
     out = pd.concat(long_frames, ignore_index=True)
-    # Final normalization keeps timestamps and identifiers consistent across chunks.
     out["date"] = pd.to_datetime(out["date"]).dt.normalize()
     out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
     out["close"] = pd.to_numeric(out["close"], errors="coerce")
     return out.dropna(subset=["close"])
 
+
 def save_feather(df: pd.DataFrame, path: Path) -> None:
-    # Ensure destination folders exist before writing the feather file.
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Persist a clean, contiguous index to avoid saving stale row labels.
     df.reset_index(drop=True).to_feather(path)
 
 
 def load_feather(path: Path) -> Optional[pd.DataFrame]:
-    # Missing cache file is a normal case; return None so caller can rebuild it.
     if not path.exists():
         return None
-    # Load and return cached dataframe when present.
     return pd.read_feather(path)
 
 
@@ -353,7 +334,6 @@ def get_latest_market_trading_day() -> pd.Timestamp:
     """
     today = pd.Timestamp.now().normalize()
     try:
-        # Use recent SPY daily bars as a proxy for the most recent US market session.
         spy = yf.download(
             tickers="SPY",
             period="10d",
@@ -366,7 +346,6 @@ def get_latest_market_trading_day() -> pd.Timestamp:
             idx = pd.to_datetime(spy.index).normalize()
             return pd.Timestamp(idx.max())
     except Exception:
-        # If Yahoo probe fails, fall back to a business-day approximation.
         pass
 
     # Fallback if market probe fails.
@@ -381,7 +360,6 @@ def update_price_cache(universe_meta: pd.DataFrame, cfg: PipelineConfig) -> pd.D
     cached = load_feather(PRICE_FEATHER)
 
     if cached is not None and not cached.empty:
-        # Normalize dates for reliable comparisons across timezone/localization differences.
         cached["date"] = pd.to_datetime(cached["date"]).dt.normalize()
         most_recent = cached["date"].max()
         print(f"Cache exists; latest cached date: {most_recent.date()} | latest market day: {latest_market_day.date()}")
@@ -389,18 +367,15 @@ def update_price_cache(universe_meta: pd.DataFrame, cfg: PipelineConfig) -> pd.D
             print("Cache is already up-to-date for the latest market trading day; using cached prices.")
             return cached
         # The +1 day on the end date is intentional: Yahoo's end date is effectively exclusive.
-        # So we start the next fetch at the day after the last cached row.
         fetch_start = (most_recent + timedelta(days=1)).strftime("%Y-%m-%d")
         print(
             f"Fetching incremental prices only from {fetch_start} to {(latest_market_day + timedelta(days=1)).date()}"
         )
     else:
-        # No cache yet: bootstrap a full lookback window from config.
         cached = pd.DataFrame(columns=["date", "Ticker", "close"])
         fetch_start = (today - pd.DateOffset(years=cfg.universe_history_years)).strftime("%Y-%m-%d")
         print(f"No cache found; fetching full history from {fetch_start}")
 
-    # Fetch only for tickers currently in the eligible universe.
     tickers = sorted(universe_meta["Ticker"].dropna().unique().tolist())
     new_prices = download_close_prices_long(
         tickers=tickers,
@@ -410,7 +385,6 @@ def update_price_cache(universe_meta: pd.DataFrame, cfg: PipelineConfig) -> pd.D
         sleep_sec=cfg.price_sleep_sec,
     )
 
-    # Merge cache + new rows, keeping the newest value per (date, ticker).
     merged = pd.concat([cached, new_prices], ignore_index=True)
     merged = merged.drop_duplicates(subset=["date", "Ticker"], keep="last")
     merged = merged.sort_values(["date", "Ticker"]).reset_index(drop=True)
@@ -419,31 +393,31 @@ def update_price_cache(universe_meta: pd.DataFrame, cfg: PipelineConfig) -> pd.D
 
 
 def safe_ratio(recent: float, old: float, clip_min: float = 0.05, clip_max: float = 10.0) -> float:
-    # Preserve NaN semantics when either side is missing.
     if pd.isna(recent) or pd.isna(old):
         return np.nan
-
-    # Guard denominators against near-zero explosions before division.
     recent_adj = max(float(recent), clip_min)
     old_adj = max(float(old), clip_min)
     ratio = recent_adj / old_adj
-
-    # Clip ratio to a bounded range so outliers cannot dominate downstream scores.
     return min(max(ratio, 1 / clip_max), clip_max)
 
 
 def trend_to_noise_ratio(price_series: pd.Series) -> float:
-    # Clean and validate series before any log-return math.
     s = pd.Series(price_series).dropna().copy()
     if len(s) < 3:
         return np.nan
     if s.iloc[0] <= 0 or s.iloc[-1] <= 0:
         return np.nan
 
-    # Trend quality = net directional move divided by total path volatility.
     log_ret = np.log(s / s.shift(1)).dropna()
     if len(log_ret) == 0:
         return np.nan
+
+    net_log_move = abs(np.log(s.iloc[-1] / s.iloc[0]))
+    total_abs_log_move = np.abs(log_ret).sum()
+    if total_abs_log_move == 0:
+        return np.nan
+    return float(net_log_move / total_abs_log_move)
+
 
 def quadratic_log_fit_r2(price_series: pd.Series) -> Tuple[float, float]:
     s = pd.Series(price_series).dropna().copy()
@@ -1157,14 +1131,12 @@ def _json_safe(val):
         return None
     return val
 
-#remove 1135
+
 def _sec_headers() -> dict:
-    # SEC blocks requests without a real email in User-Agent.
     user_agent = os.getenv("SEC_USER_AGENT", "StocksPipeline research your_email@example.com")
     return {"User-Agent": user_agent, "Accept-Encoding": "gzip, deflate"}
 
 
-# politely wait between requests so we don't get rate-limited or banned
 def _throttled_get(url: str, timeout: int, limiter: dict, headers: Optional[dict] = None) -> requests.Response:
     headers = headers or {}
     with limiter["lock"]:
@@ -1172,20 +1144,18 @@ def _throttled_get(url: str, timeout: int, limiter: dict, headers: Optional[dict
         wait = limiter["next_ts"] - now
         if wait > 0:
             time.sleep(wait)
-        limiter["next_ts"] = time.time() + limiter["interval"]  # update inside lock to prevent races
+        limiter["next_ts"] = time.time() + limiter["interval"]
     resp = requests.get(url, timeout=timeout, headers=headers)
     resp.raise_for_status()
     return resp
 
 
-# trims the raw SEC filings list down to just the handful we actually care about
 def _select_recent_filings(df_recent: pd.DataFrame, cfg: PipelineConfig) -> pd.DataFrame:
     if df_recent.empty:
         return df_recent
     df = df_recent.copy()
     df["form_upper"] = df["form"].astype(str).str.upper()
     df["filingDate"] = pd.to_datetime(df["filingDate"], errors="coerce")
-    # 1 annual, 2 quarterly, N event filings — most recent of each.
     k = df[df["form_upper"] == "10-K"].sort_values("filingDate", ascending=False).head(1)
     q = df[df["form_upper"] == "10-Q"].sort_values("filingDate", ascending=False).head(2)
     e = df[df["form_upper"] == "8-K"].sort_values("filingDate", ascending=False).head(cfg.sec_num_8k)
@@ -1194,7 +1164,6 @@ def _select_recent_filings(df_recent: pd.DataFrame, cfg: PipelineConfig) -> pd.D
 
 
 def _build_sec_doc_url(cik_10: str, accession_number: str, primary_document: str) -> str:
-    # SEC URLs need no dashes in the accession number and no leading zeros in the CIK.
     accession_nodashes = accession_number.replace("-", "")
     cik_no_leading_zeros = str(int(cik_10))
     return f"https://www.sec.gov/Archives/edgar/data/{cik_no_leading_zeros}/{accession_nodashes}/{primary_document}"
@@ -1212,15 +1181,14 @@ def build_agents_data_packages(
         ticker_map_resp = _throttled_get(ticker_map_url, cfg.sec_timeout_sec, limiter, headers=sec_headers).json()
         sec_ticker_to_cik = {str(v["ticker"]).upper(): str(v["cik_str"]).zfill(10) for v in ticker_map_resp.values()}
     except Exception:
-        sec_ticker_to_cik = {}  # SEC unreachable; filings will be skipped
+        sec_ticker_to_cik = {}
 
-    # Remove stale ticker dirs no longer in the current universe.
     expected_tickers = {str(t).upper() for t in final_df["Ticker"].dropna().astype(str)}
     for child in AGENTS_DATA_PACKAGE_DIR.iterdir():
         if child.is_dir() and child.name.upper() not in expected_tickers:
             shutil.rmtree(child, ignore_errors=True)
 
-    meta_map = (  # keyed by ticker for O(1) lookup below
+    meta_map = (
         universe_meta[["Ticker", "Company", "sector", "industry", "market_cap_num"]]
         .drop_duplicates(subset=["Ticker"])
         .set_index("Ticker")
@@ -1254,13 +1222,11 @@ def build_agents_data_packages(
     ]
 
     def _save_df(df_obj: pd.DataFrame, csv_path: Path) -> None:
-        # skip silently if there's nothing to write
         if df_obj is None or df_obj.empty:
             return
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         df_obj.to_csv(csv_path, index=True)
 
-    # normalize anything date-like into a midnight Timestamp, or None if unparseable
     def _to_ts(val) -> Optional[pd.Timestamp]:
         if val is None:
             return None
@@ -1271,7 +1237,6 @@ def build_agents_data_packages(
 
     today = pd.Timestamp.now().normalize()
 
-    # builds the full data folder for a single ticker — Yahoo + SEC filings
     def _build_one(row: pd.Series) -> dict:
         ticker = str(row["Ticker"]).upper()
         pkg_dir = AGENTS_DATA_PACKAGE_DIR / _safe_filename(ticker)
@@ -1293,7 +1258,7 @@ def build_agents_data_packages(
 
             package_asof = _to_ts(existing_meta.get("package_asof_date"))
             package_age_days = (today - package_asof).days if package_asof is not None else 99999
-            is_package_fresh = package_age_days <= cfg.package_refresh_days  # treat missing as ancient
+            is_package_fresh = package_age_days <= cfg.package_refresh_days
 
             cik_10 = sec_ticker_to_cik.get(ticker)
             out["cik_10"] = cik_10
@@ -1387,7 +1352,7 @@ def build_agents_data_packages(
                             with open(filings_dir / save_name, "wb") as fw:
                                 fw.write(content)
                         except Exception:
-                            continue  # one bad filing shouldn't blow up the rest
+                            continue
 
             latest_10k = None
             latest_10q = None
@@ -1422,7 +1387,6 @@ def build_agents_data_packages(
             return out
 
     results = []
-    # cap workers so we don't hammer the SEC or Yahoo with too many parallel connections
     worker_count = min(max(1, cfg.package_max_workers), max(1, len(final_df)))
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = [executor.submit(_build_one, row) for _, row in final_df.iterrows()]
@@ -1432,7 +1396,7 @@ def build_agents_data_packages(
                 pbar.update(1)
     return pd.DataFrame(results).sort_values("Ticker").reset_index(drop=True)
 
-# make sure all output folders exist before anything tries to write to them
+
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1440,7 +1404,7 @@ def ensure_dirs() -> None:
     AGENTS_DATA_PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
     CHART_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
-# all the knobs you can tweak from the command line without touching the code
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stock screening and data package pipeline")
     parser.add_argument(
@@ -1485,6 +1449,7 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
+
 def main() -> None:
     args = parse_args()
     cfg = PipelineConfig()
@@ -1528,7 +1493,8 @@ def main() -> None:
 
     print("5) Building combined ranking (technical + insider)...")
     combined_df = merge_insider_data(technical_df, insider_ranked_df)
-    # if insider coverage is sparse the combined score is basically meaningless, so fail loud
+    # If insider coverage is missing for too many rows, the combined rank becomes misleading,
+    # so the script stops instead of quietly pretending the data is complete.
     validate_insider_coverage(combined_df, cfg.min_insider_coverage_ratio)
     combined_df = add_normalized_scores(combined_df)
     combined_df = combined_df.sort_values(
@@ -1588,7 +1554,7 @@ def main() -> None:
     package_manifest_df.to_csv(package_manifest_path, index=False)
 
     mongo = get_mongo_store()
-    screening_run_id = datetime.now().strftime("%Y%m%d_%H%M%S")  # used as a unique key for this run
+    screening_run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     if mongo is not None:
         mongo.upsert_global_cache(
             "latest_screening_snapshot",

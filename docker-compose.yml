@@ -1,40 +1,53 @@
 services:
-  # persistent database
   mongodb:
-    image: mongo:7
+    build: ./mongo_service/db
     ports:
       - "27017:27017"
-        build:
-          context: ./mongo_service/db
-        ports:
-          - "27017:27017"
-        environment:
-          - MONGO_INITDB_DATABASE=stocks_app
-          - PIPELINE_OUTPUT_DIR=/seed/pipeline
-        volumes:
-          - mongo_data:/data/db
-          - ./pipeline/output:/seed/pipeline:ro
-    build: ./web
-          - ./pipeline/output:/seed/pipeline:ro
+    environment:
+      - MONGO_INITDB_DATABASE=stocks_app
+    volumes:
+      - mongo_data:/data/db
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
     ports:
-      - "5000:5000"
+      - "5001:5000"
+    env_file:
       - .env
     environment:
       - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DB_NAME=stocks_app
     depends_on:
       - mongodb
 
-  # opt-in service, run with --profile pipeline
   pipeline:
     build: ./pipeline
     env_file:
       - .env
     environment:
       - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DB_NAME=stocks_app
     depends_on:
       - mongodb
     profiles:
       - pipeline
+
+  mongo_seed:
+    build: ./mongo_service
+    env_file:
+      - .env
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DB_NAME=stocks_app
+      - PIPELINE_OUTPUT_DIR=/seed/pipeline/output
+    volumes:
+      - ./pipeline/output:/seed/pipeline/output:ro
+    depends_on:
+      - mongodb
+    profiles:
+      - seed
 
 volumes:
   mongo_data:

@@ -56,10 +56,6 @@ def test_index_redirects_to_login_when_logged_out(monkeypatch):
     app = web_app.create_app()
     app.config["TESTING"] = True
 
-    @app.route("/login")
-    def login():
-        return "login page"
-
     client = app.test_client()
     response = client.get("/")
 
@@ -72,10 +68,6 @@ def test_index_redirects_to_dashboard_when_logged_in(monkeypatch):
 
     app = web_app.create_app()
     app.config["TESTING"] = True
-
-    @app.route("/dashboard")
-    def dashboard():
-        return "dashboard page"
 
     client = app.test_client()
 

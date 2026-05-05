@@ -1,13 +1,13 @@
 FROM python:3.11-slim
 
-WORKDIR /app
+WORKDIR /app/web
 
-COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+COPY web/requirements.txt /tmp/web-requirements.txt
+COPY pipeline/requirements.txt /tmp/pipeline-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/web-requirements.txt -r /tmp/pipeline-requirements.txt
 
-COPY . /app
+COPY web /app/web
+COPY pipeline /app/pipeline
 
-CMD ["python", "seed_db.py"]
-
-
+CMD ["python", "app.py"]
 

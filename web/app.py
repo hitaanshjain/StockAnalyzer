@@ -25,12 +25,15 @@ from mongo_store import MongoStore
 
 
 BASE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR.parent
+PIPELINE_DIR = REPO_ROOT / "pipeline"
+PIPELINE_OUTPUT_ROOT = PIPELINE_DIR / "output" / "agent_runs"
 OUTPUT_ROOT = BASE_DIR / "output" / "web_jobs"
-PIPELINE_SCRIPT = BASE_DIR / "run_pipeline.py"
+PIPELINE_SCRIPT = PIPELINE_DIR / "run_pipeline.py"
 
 
 def create_app() -> Flask:
-    app = Flask(__name__)
+    app = Flask(__name__, template_folder="templates")
     app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(16))
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     
@@ -92,7 +95,7 @@ def create_app() -> Flask:
         if not path_str:
             return ""
         try:
-            return str(Path(path_str).resolve().relative_to(BASE_DIR.resolve()))
+            return str(Path(path_str).resolve().relative_to(PIPELINE_DIR.resolve()))
         except Exception:
             return ""
 
@@ -107,7 +110,7 @@ def create_app() -> Flask:
 
     def infer_job_status(job: dict) -> dict:
         run_id = str(job.get("run_id", ""))
-        run_root = BASE_DIR / "output" / "agent_runs" / run_id
+        run_root = PIPELINE_OUTPUT_ROOT / run_id
         combined_path = run_root / "combined_per_stock_reports.txt"
         manifest_path = run_root / "run_manifest.json"
         current_status = str(job.get("status", "unknown"))
@@ -171,7 +174,6 @@ def create_app() -> Flask:
         if "user_id" in session:
             return redirect(url_for("dashboard"))
         return redirect(url_for("login"))
-    return app
 
 
     @app.route("/register", methods=["GET", "POST"])
@@ -289,7 +291,7 @@ def create_app() -> Flask:
         with open(log_path, "w", encoding="utf-8", buffering=1) as log_file:
             proc = subprocess.Popen(
                 [sys.executable, "-u", *command[1:]],
-                cwd=BASE_DIR,
+                cwd=PIPELINE_DIR,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -381,7 +383,7 @@ def create_app() -> Flask:
         for row in selected_rows:
             ticker = str(row.get("Ticker", "")).upper()
             rank = int(row.get("screen_rank", -1))
-            txt_path = BASE_DIR / "output" / "agent_runs" / job["run_id"] / "per_stock" / ticker / f"{ticker}.txt"
+            txt_path = PIPELINE_OUTPUT_ROOT / job["run_id"] / "per_stock" / ticker / f"{ticker}.txt"
             reports.append(
                 {
                     "ticker": ticker,
@@ -408,9 +410,9 @@ def create_app() -> Flask:
         maybe_redirect = login_required()
         if maybe_redirect is not None:
             return maybe_redirect
-        full_path = (BASE_DIR / artifact_path).resolve()
+        full_path = (PIPELINE_DIR / artifact_path).resolve()
         try:
-            full_path.relative_to(BASE_DIR.resolve())
+            full_path.relative_to(PIPELINE_DIR.resolve())
         except Exception:
             abort(403)
         if not full_path.exists() or not full_path.is_file():
@@ -424,4 +426,4 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    app.run(debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", debug=True, use_reloader=False)
