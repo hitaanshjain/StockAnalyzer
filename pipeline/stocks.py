@@ -332,28 +332,30 @@ def download_close_prices_long(
     return out.dropna(subset=["close"])
 
 def save_feather(df: pd.DataFrame, path: Path) -> None:
-    # Ensure destination folders exist before writing the feather file.
+    # Create parent directories once so cache writes don't fail on first run.
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Persist a clean, contiguous index to avoid saving stale row labels.
+    # Write with a fresh RangeIndex to avoid persisting stale index artifacts.
     df.reset_index(drop=True).to_feather(path)
 
 
 def load_feather(path: Path) -> Optional[pd.DataFrame]:
-    # Missing cache file is a normal case; return None so caller can rebuild it.
+    # Missing cache is expected on cold start; caller decides whether to rebuild.
     if not path.exists():
         return None
-    # Load and return cached dataframe when present.
+    # Happy path: read the cached table from disk.
     return pd.read_feather(path)
 
 
 def get_latest_market_trading_day() -> pd.Timestamp:
     """
-    Infer latest US market trading day from recent SPY bars.
-    Falls back to previous business day on fetch issues.
+    Return the latest inferred U.S. market trading day.
+
+    Primary method: most recent daily SPY bar from Yahoo.
+    Fallback: previous business day heuristic if data fetch fails.
     """
     today = pd.Timestamp.now().normalize()
     try:
-        # Use recent SPY daily bars as a proxy for the most recent US market session.
+        # SPY trades every regular U.S. market session, so it's a practical market-day proxy.
         spy = yf.download(
             tickers="SPY",
             period="10d",
@@ -366,30 +368,34 @@ def get_latest_market_trading_day() -> pd.Timestamp:
             idx = pd.to_datetime(spy.index).normalize()
             return pd.Timestamp(idx.max())
     except Exception:
-        # If Yahoo probe fails, fall back to a business-day approximation.
+        # Network/API hiccup: use deterministic fallback below.
         pass
 
-    # Fallback if market probe fails.
+    # Weekend guard for fallback: shift Sat/Sun to the most recent business day.
     if today.weekday() >= 5:
         return today - pd.offsets.BDay(1)
+    # Weekday fallback assumes market has most likely traded today.
     return today
 
 
 def update_price_cache(universe_meta: pd.DataFrame, cfg: PipelineConfig) -> pd.DataFrame:
+    # Compute once to keep all freshness checks aligned to the same run timestamp.
     today = pd.Timestamp.now().normalize()
+    # Use market day (not wall-clock date) so weekends/holidays don't trigger false refreshes.
     latest_market_day = get_latest_market_trading_day()
     cached = load_feather(PRICE_FEATHER)
 
     if cached is not None and not cached.empty:
-        # Normalize dates for reliable comparisons across timezone/localization differences.
+        # Normalize cached timestamps to date-only values for stable comparisons.
         cached["date"] = pd.to_datetime(cached["date"]).dt.normalize()
         most_recent = cached["date"].max()
         print(f"Cache exists; latest cached date: {most_recent.date()} | latest market day: {latest_market_day.date()}")
         if most_recent >= latest_market_day:
+            # Cache already covers the latest session; skip download.
             print("Cache is already up-to-date for the latest market trading day; using cached prices.")
             return cached
-        # The +1 day on the end date is intentional: Yahoo's end date is effectively exclusive.
-        # So we start the next fetch at the day after the last cached row.
+        # Incremental mode: fetch only dates strictly after the cached max date.
+        # Note: Yahoo end_date behaves as exclusive, so requests use +1 day at call site.
         fetch_start = (most_recent + timedelta(days=1)).strftime("%Y-%m-%d")
         print(
             f"Fetching incremental prices only from {fetch_start} to {(latest_market_day + timedelta(days=1)).date()}"
@@ -412,35 +418,37 @@ def update_price_cache(universe_meta: pd.DataFrame, cfg: PipelineConfig) -> pd.D
 
     # Merge cache + new rows, keeping the newest value per (date, ticker).
     merged = pd.concat([cached, new_prices], ignore_index=True)
+    # Deduplicate defensive merges when overlapping windows are fetched.
     merged = merged.drop_duplicates(subset=["date", "Ticker"], keep="last")
+    # Keep deterministic ordering so downstream pivots/charts are reproducible.
     merged = merged.sort_values(["date", "Ticker"]).reset_index(drop=True)
     save_feather(merged, PRICE_FEATHER)
     return merged
 
 
 def safe_ratio(recent: float, old: float, clip_min: float = 0.05, clip_max: float = 10.0) -> float:
-    # Preserve NaN semantics when either side is missing.
+    # Respect missing inputs: if either side is unknown, ratio should stay unknown.
     if pd.isna(recent) or pd.isna(old):
         return np.nan
 
-    # Guard denominators against near-zero explosions before division.
+    # Floor both values before division to avoid unstable near-zero behavior.
     recent_adj = max(float(recent), clip_min)
     old_adj = max(float(old), clip_min)
     ratio = recent_adj / old_adj
 
-    # Clip ratio to a bounded range so outliers cannot dominate downstream scores.
+    # Symmetric clipping keeps extreme ratios from overpowering composite scores.
     return min(max(ratio, 1 / clip_max), clip_max)
 
 
 def trend_to_noise_ratio(price_series: pd.Series) -> float:
-    # Clean and validate series before any log-return math.
+    # Sanitize inputs first so log math and divides are well-defined.
     s = pd.Series(price_series).dropna().copy()
     if len(s) < 3:
         return np.nan
     if s.iloc[0] <= 0 or s.iloc[-1] <= 0:
         return np.nan
 
-    # Trend quality = net directional move divided by total path volatility.
+    # Trend-to-noise intuition: directional move divided by cumulative day-to-day noise.
     log_ret = np.log(s / s.shift(1)).dropna()
     if len(log_ret) == 0:
         return np.nan
