@@ -45,11 +45,13 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # build the docker image and push it to docker hub
+      # context must be repo root so the Dockerfile can reach both web/ and pipeline/
       - name: Build and push Docker image
         if: github.event_name == 'push'
         uses: docker/build-push-action@v5
         with:
-          context: ./web
+          context: .
+          file: ./web/Dockerfile
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/stocks-web:latest
 
