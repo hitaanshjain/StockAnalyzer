@@ -1,0 +1,54 @@
+name: Pipeline CI/CD
+
+# runs on every push or PR to main
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # pull the code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # set up python so we can run the tests
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # install the pipeline's dependencies + testing tools
+      - name: Install dependencies
+        run: |
+          cd pipeline
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      # run tests — fails the pipeline if coverage drops below 80%
+      - name: Run tests
+        run: |
+          cd pipeline
+          pytest tests/ --cov=. --cov-report=term-missing --cov-fail-under=80
+
+      # log into docker hub so we can push the image
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # build the docker image and push it to docker hub
+      # no deploy step — the pipeline runs on demand, not as an online service
+      - name: Build and push Docker image
+        if: github.event_name == 'push'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./pipeline
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/stocks-pipeline:latest
