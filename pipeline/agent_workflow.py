@@ -414,15 +414,47 @@ def build_analyst_user_prompt(ticker: str, package_files: List[Path]) -> str:
         f"{manifest}\n\n"
         "Return the exact required section structure and include FINAL_JSON at the end."
     )
-#line 360
-  
-#line 395
+
+def create_response(
+    session: requests.Session,
+    api_key: str,
+    model: str,
+    reasoning_effort: str,
+    web_tool_type: str,
+    system_prompt: str,
+    user_text: str,
+    file_ids: List[str],
+) -> dict:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    # Attach the text prompt first, then any uploaded file references.
+    content = [{"type": "input_text", "text": user_text}]
+    content.extend([{"type": "input_file", "file_id": fid} for fid in file_ids])
+
+    payload = {
+        "model": model,
+        "reasoning": {"effort": reasoning_effort},
+        "tools": [{"type": web_tool_type}],
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
+            {"role": "user", "content": content},
+        ],
+    }
+    try:
+        return http_post_json(session, f"{OPENAI_BASE_URL}/responses", headers=headers, payload=payload)
+    except Exception as first_exc:
+        # Some deployments only support the older "web_search" name; retry with that.
+        if web_tool_type != "web_search":
+            payload["tools"] = [{"type": "web_search"}]
+            return http_post_json(session, f"{OPENAI_BASE_URL}/responses", headers=headers, payload=payload)
+        raise RuntimeError(str(first_exc))
+    
 # Safe for use in file and directory names
 def sanitize_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
 
 
 def make_json_safe(value):
+    # Recursively convert any non-serializable types before writing to JSON.
     if isinstance(value, dict):
         return {str(k): make_json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -480,5 +512,268 @@ def create_session_chart_bundle(run_dirs: Dict[str, Path], selected_rows: List[D
         "chart_pdf_path": str(pdf_path) if included else "",
         "chart_image_paths": included,
     }
-#452
+
+def run_one_ticker(
+    ticker_row: Dict[str, object],
+    run_dirs: Dict[str, Path],
+    api_key: str,
+    model: str,
+    reasoning_effort: str,
+    web_tool_type: str,
+    include_feather: bool,
+    max_sec_html_files: int,
+    max_file_size_mb: float,
+) -> dict:
+    ticker = str(ticker_row["Ticker"]).upper()
+    started = time.time()
+    out = {
+        "ticker": ticker,
+        "screen_rank": int(ticker_row.get("screen_rank", -1)),
+        "status": "ok",
+        "error": "",
+        "n_files_uploaded": 0,
+        "elapsed_sec": None,
+        "text_path": "",
+        "json_path": "",
+        "raw_path": "",
+        "parsed_report": None,
+    }
+    ticker_dir = run_dirs["per_stock"] / ticker
+    ticker_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        package_files = list_ticker_package_files(
+            ticker,
+            include_feather=include_feather,
+            max_sec_html_files=max_sec_html_files,
+            max_file_size_mb=max_file_size_mb,
+        )
+        if not package_files:
+            raise RuntimeError(f"No package files found for {ticker}")
+
+        session = requests.Session()
+        uploaded = []
+        for path in package_files:
+            fid = upload_file(session, api_key, path)
+            uploaded.append({"path": str(path), "file_id": fid})
+
+        out["n_files_uploaded"] = len(uploaded)
+        (run_dirs["uploaded"] / f"{ticker}_uploaded_files.json").write_text(
+            json.dumps(uploaded, indent=2), encoding="utf-8"
+        )
+
+        user_prompt = build_analyst_user_prompt(ticker, package_files)
+        try:
+            resp = create_response(
+                session=session,
+                api_key=api_key,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                web_tool_type=web_tool_type,
+                system_prompt=ANALYST_SYSTEM_PROMPT,
+                user_text=user_prompt,
+                file_ids=[x["file_id"] for x in uploaded],
+            )
+        except Exception as exc:
+            if "context_length_exceeded" not in str(exc):
+                raise
+            # Retry with SEC HTML removed when context is too large.
+            reduced_ids = [
+                x["file_id"]
+                for x in uploaded
+                if not str(x["path"]).lower().endswith(".htm") and not str(x["path"]).lower().endswith(".html")
+            ]
+            if not reduced_ids:
+                raise
+            resp = create_response(
+                session=session,
+                api_key=api_key,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                web_tool_type=web_tool_type,
+                system_prompt=ANALYST_SYSTEM_PROMPT,
+                user_text=user_prompt + "\n\nNote: SEC filing HTML attachments were removed due to context limits.",
+                file_ids=reduced_ids,
+            )
+
+        raw_path = ticker_dir / f"{ticker}.response_raw.json"
+        txt_path = ticker_dir / f"{ticker}.txt"
+        json_path = ticker_dir / f"{ticker}.json"
+        raw_path.write_text(json.dumps(resp, indent=2), encoding="utf-8")
+        text = extract_response_text(resp)
+        txt_path.write_text(text, encoding="utf-8")
+        parsed = extract_final_json_block(text)
+        if parsed is not None:
+            json_path.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+        out["text_path"] = str(txt_path)
+        out["json_path"] = str(json_path) if parsed is not None else ""
+        out["raw_path"] = str(raw_path)
+        out["parsed_report"] = parsed
+    except Exception as exc:
+        out["status"] = "error"
+        out["error"] = str(exc)
+        (ticker_dir / f"{ticker}.error.txt").write_text(str(exc), encoding="utf-8")
+    finally:
+        out["elapsed_sec"] = round(time.time() - started, 2)
+    return out
+
+
+def concatenate_ticker_reports(run_dirs: Dict[str, Path], selected_rows: List[Dict[str, object]]) -> Dict[str, object]:
+    # Stitch all per-ticker text reports into one file for easy review.
+    blocks = []
+    included = []
+    for row in selected_rows:
+        ticker = str(row["Ticker"]).upper()
+        rank = int(row["screen_rank"])
+        txt_path = run_dirs["per_stock"] / ticker / f"{ticker}.txt"
+        # Skip tickers whose agent run failed or produced no output file.
+        if not txt_path.exists():
+            continue
+        blocks.append(f"===== Rank {rank} | {ticker} =====\n\n{txt_path.read_text(encoding='utf-8')}")
+        included.append(ticker)
+    combined_text = "\n\n".join(blocks)
+    output_path = run_dirs["root"] / "combined_per_stock_reports.txt"
+    output_path.write_text(combined_text, encoding="utf-8")
+    return {"combined_text": combined_text, "combined_path": str(output_path), "included_tickers": included}
+
+
+def main() -> None:
+    args = parse_args()
+    api_key = get_api_key()
+    mongo = get_mongo_store()
+    if mongo is not None and args.user_id:
+        mongo.upsert_user(args.user_id, email=(args.user_email or None))
+
+    run_dirs = build_run_dirs(args.run_id)
+
+    skip_tickers = {t.strip().upper() for t in args.skip_tickers.split(",") if t.strip()}
+    selected_rows = load_ranked_tickers(
+        SCREENING_FEATHER,
+        start_rank=max(1, int(args.start_rank)),
+        end_rank=max(1, int(args.end_rank)),
+        skip_tickers=skip_tickers,
+    )
+    tickers = [str(row["Ticker"]).upper() for row in selected_rows]
+    chart_bundle = create_session_chart_bundle(run_dirs, selected_rows)
+    session_key = run_dirs["root"].name
+    mongo_session_id = None
+    if mongo is not None:
+        mongo_session_id = mongo.create_analysis_session(
+            make_json_safe(
+                {
+                    "session_key": session_key,
+                    "user_id": args.user_id,
+                    "user_email": args.user_email or None,
+                    "run_dir": str(run_dirs["root"]),
+                    "start_rank": int(args.start_rank),
+                "end_rank": int(args.end_rank),
+                "selected_tickers": tickers,
+                "selected_rows": selected_rows,
+                    "chart_artifacts": chart_bundle,
+                    "status": "running",
+                    "model": args.model,
+                    "reasoning_effort": args.reasoning_effort,
+                }
+            )
+        )
+    print(f"Run folder: {run_dirs['root']}")
+    print(
+        f"Tickers ({len(tickers)}) | ranks {int(args.start_rank)}-{int(args.end_rank)}: "
+        f"{', '.join(tickers)}"
+    )
+
+    # Cap workers to the actual ticker count so we don't spin up idle threads.
+    worker_count = min(max(1, args.max_workers), len(tickers))
+    results = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(
+                run_one_ticker,
+                ticker_row=row,
+                run_dirs=run_dirs,
+                api_key=api_key,
+                model=args.model,
+                reasoning_effort=args.reasoning_effort,
+                web_tool_type=args.web_tool_type,
+                include_feather=bool(args.include_feather),
+                max_sec_html_files=int(args.max_sec_html_files),
+                max_file_size_mb=float(args.max_file_size_mb),
+            )
+            for row in selected_rows
+        ]
+        for future in as_completed(futures):
+            item = future.result()
+            results.append(item)
+            print(
+                f"[rank {item['screen_rank']} | {item['ticker']}] status={item['status']} files={item['n_files_uploaded']} "
+                f"elapsed={item['elapsed_sec']}s"
+            )
+            if mongo is not None and mongo_session_id is not None:
+                mongo.upsert_stock_report(
+                    mongo_session_id,
+                    item["ticker"],
+                    {
+                        "screen_rank": item["screen_rank"],
+                        "status": item["status"],
+                        "error": item["error"],
+                        "text_path": item["text_path"],
+                        "json_path": item["json_path"],
+                        "raw_path": item["raw_path"],
+                        "report_json": item["parsed_report"],
+                    },
+                )
+
+    # Write a single manifest so the run can be replayed or audited later.
+    manifest_path = run_dirs["root"] / "run_manifest.json"
+    combined = concatenate_ticker_reports(run_dirs, selected_rows)
+    manifest = {
+        "created_at": datetime.now().isoformat(),
+        "start_rank": args.start_rank,
+        "end_rank": args.end_rank,
+        "tickers": tickers,
+        "selected_rows": selected_rows,
+        "model": args.model,
+        "reasoning_effort": args.reasoning_effort,
+        "web_tool_type": args.web_tool_type,
+        "chart_bundle": chart_bundle,
+        "combined_reports_path": combined["combined_path"],
+        "results": sorted(results, key=lambda x: x["ticker"]),
+    }
+    manifest_path.write_text(json.dumps(make_json_safe(manifest), indent=2), encoding="utf-8")
+
+    ok_tickers = [r["ticker"] for r in results if r["status"] == "ok"]
+    if not ok_tickers:
+        if mongo is not None and mongo_session_id is not None:
+            mongo.update_analysis_session(
+                mongo_session_id,
+            {
+                "status": "error",
+                "manifest_path": str(manifest_path),
+                "combined_reports_path": combined["combined_path"],
+                "results": make_json_safe(results),
+            },
+        )
+        raise RuntimeError("All per-ticker agent runs failed.")
+    if mongo is not None and mongo_session_id is not None:
+        mongo.update_analysis_session(
+            mongo_session_id,
+            {
+                "status": "completed",
+                "manifest_path": str(manifest_path),
+                "combined_reports_path": combined["combined_path"],
+                "included_tickers": combined["included_tickers"],
+                "successful_tickers": sorted(ok_tickers),
+                "results": make_json_safe(results),
+            },
+        )
+    print(f"Saved run manifest: {manifest_path}")
+    print(f"Saved combined reports: {combined['combined_path']}")
+    if chart_bundle["chart_pdf_path"]:
+        print(f"Saved selected chart pdf: {chart_bundle['chart_pdf_path']}")
+    print(f"Successful per-ticker reports: {len(ok_tickers)} ({', '.join(sorted(ok_tickers))})")
+
+
+if __name__ == "__main__":
+    main()
+
 
