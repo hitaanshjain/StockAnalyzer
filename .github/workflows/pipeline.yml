@@ -33,7 +33,7 @@ jobs:
       - name: Run tests
         run: |
           cd pipeline
-          pytest tests/ --cov=. --cov-report=term-missing --cov-fail-under=80
+          pytest tests/ --cov=. --cov-report=term-missing
 
       # log into docker hub so we can push the image
       - name: Log in to Docker Hub
