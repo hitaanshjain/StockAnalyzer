@@ -976,6 +976,8 @@ def build_screening_union_df(
 
 
 def merge_insider_data(base_df: pd.DataFrame, insider_summary_df: pd.DataFrame) -> pd.DataFrame:
+    if base_df.empty or "Ticker" not in base_df.columns:
+        return base_df
     merged = base_df.merge(insider_summary_df, on="Ticker", how="left")
     for c in ["buy_dollars_60d", "unique_buyers_60d", "insider_score_60d", "n_insider_rows"]:
         if c in merged.columns:
