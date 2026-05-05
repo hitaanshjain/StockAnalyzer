@@ -57,17 +57,24 @@ class MongoStore:
         self.client: Optional[MongoClient] = None
         self.db: Optional[Database] = None
 
+        self.connect()
+
+    def connect(self) -> bool:
         if not PYMONGO_AVAILABLE or not self.uri:
-            return
+            self.client = None
+            self.db = None
+            return False
 
         try:
             self.client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
             self.db = self.client[self.db_name]
             self.client.admin.command("ping")
             self._ensure_indexes()
+            return True
         except Exception:
             self.client = None
             self.db = None
+            return False
 
     @property
     def enabled(self) -> bool:
