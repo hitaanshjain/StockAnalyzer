@@ -285,3 +285,124 @@ def http_post_json(
 
     # Surface the most recent failure after all retry attempts are exhausted.
     raise RuntimeError(f"POST failed after {retries} attempts: {last_err}")
+
+def upload_file(session: requests.Session, api_key: str, file_path: Path, retries: int = 3) -> str:
+    # Track the last error so the final raised message is informative.
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            # Open the file in binary mode and POST it to the OpenAI Files API.
+            with open(file_path, "rb") as f:
+                resp = session.post(
+                    f"{OPENAI_BASE_URL}/files",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    data={"purpose": "user_data"},
+                    files={"file": (file_path.name, f)},
+                    timeout=180,
+                )
+            if resp.status_code >= 400:
+                raise RuntimeError(f"{resp.status_code} {resp.text}")
+            body = resp.json()
+            file_id = body.get("id")
+            # The API should always return an id on success; treat missing id as an error.
+            if not file_id:
+                raise RuntimeError(f"No file id returned for {file_path}")
+            return file_id
+        except Exception as exc:
+            last_err = exc
+            # Wait with linear backoff before the next attempt.
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+    raise RuntimeError(f"File upload failed for {file_path}: {last_err}")
+
+
+def extract_response_text(resp_json: dict) -> str:
+    # Fast path: newer Responses API versions return a top-level output_text field.
+    if isinstance(resp_json.get("output_text"), str) and resp_json["output_text"].strip():
+        return resp_json["output_text"]
+
+    # Fallback: walk the output array and collect all text content blocks.
+    chunks: List[str] = []
+    for item in resp_json.get("output", []) or []:
+        content = item.get("content", []) if isinstance(item, dict) else []
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            # Accept both output_text and plain text block types.
+            if c.get("type") in {"output_text", "text"}:
+                txt = c.get("text", "")
+                if txt:
+                    chunks.append(txt)
+    return "\n\n".join(chunks).strip()
+
+
+def extract_final_json_block(text: str) -> Optional[dict]:
+    # Locate the FINAL_JSON marker that the analyst prompt requires at the end of the response.
+    marker = "FINAL_JSON:"
+    idx = text.find(marker)
+    if idx == -1:
+        return None
+    tail = text[idx + len(marker) :]
+
+    # Find the opening brace of the JSON object.
+    start = tail.find("{")
+    if start == -1:
+        return None
+    snippet = tail[start:]
+
+    # Walk character-by-character to find the matching closing brace,
+    # correctly handling escaped characters inside strings.
+    depth = 0
+    in_str = False
+    esc = False
+    end_pos = None
+    for i, ch in enumerate(snippet):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end_pos = i + 1
+                break
+    if not end_pos:
+        return None
+    raw = snippet[:end_pos]
+    # Parse the extracted JSON; return None if the model produced malformed output.
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def build_analyst_user_prompt(ticker: str, package_files: List[Path]) -> str:
+    # Build a relative path list so the model sees tidy names rather than full filesystem paths.
+    rels = []
+    for p in package_files:
+        try:
+            rels.append(str(p.relative_to(AGENTS_DATA_PACKAGE_DIR / ticker)))
+        except Exception:
+            rels.append(p.name)
+
+    # Format the file list as a bullet manifest embedded in the prompt.
+    manifest = "\n".join(f"- {r}" for r in rels)
+
+    # Return the full user message that instructs the analyst agent on what to produce.
+    return (
+        f"Analyze ticker: {ticker}\n\n"
+        "Use the attached files as primary evidence. Web search is allowed for missing/stale data.\n"
+        "Be explicit about what changed, what is priced in, and expected value.\n\n"
+        "Attached file manifest:\n"
+        f"{manifest}\n\n"
+        "Return the exact required section structure and include FINAL_JSON at the end."
+    )
+
