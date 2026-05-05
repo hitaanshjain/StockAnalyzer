@@ -197,6 +197,116 @@ def fetch_yahoo_metadata(
     meta["market_cap_num"] = pd.to_numeric(meta["market_cap_num"], errors="coerce")
     meta["regularMarketPrice"] = pd.to_numeric(meta["regularMarketPrice"], errors="coerce")
     return meta
+def update_metadata_cache(raw_universe: pd.DataFrame, cfg: PipelineConfig, force_refresh: bool = False) -> pd.DataFrame:
+    """Return universe metadata from cache when fresh, backfilling only missing tickers when needed."""
+    today = pd.Timestamp.now().normalize()
+    tickers = raw_universe["Ticker"].dropna().astype(str).str.upper().tolist()
+    cached = load_feather(META_FEATHER)
+
+    if (not force_refresh) and cached is not None and not cached.empty and "meta_asof_date" in cached.columns:
+        cached["meta_asof_date"] = pd.to_datetime(cached["meta_asof_date"], errors="coerce").dt.normalize()
+        latest_asof = cached["meta_asof_date"].max()
+        cached_tickers = set(cached["Ticker"].dropna().astype(str).str.upper())
+        age_days = (today - latest_asof).days if pd.notna(latest_asof) else 99999
+        missing = sorted(set(tickers) - cached_tickers)
+
+        if age_days <= cfg.metadata_refresh_days and not missing:
+            print(
+                f"Metadata cache age {age_days} day(s) <= {cfg.metadata_refresh_days}; "
+                "using cached metadata."
+            )
+            return cached[cached["Ticker"].isin(tickers)].drop_duplicates(subset=["Ticker"]).copy()
+
+        if age_days <= cfg.metadata_refresh_days and missing:
+            # Cache is still fresh but missing some tickers; fetch only gaps to avoid unnecessary Yahoo requests.
+            print(
+                f"Metadata cache is fresh ({age_days} day(s)) but missing {len(missing)} ticker(s); "
+                "fetching only missing metadata."
+            )
+            meta_missing = fetch_yahoo_metadata(
+                missing,
+                chunk_size=cfg.meta_chunk_size,
+                sleep_sec=cfg.meta_sleep_sec,
+                max_workers=cfg.meta_max_workers,
+            )
+            if not meta_missing.empty:
+                meta_missing["meta_asof_date"] = today
+                merged = pd.concat([cached, meta_missing], ignore_index=True)
+                merged = merged.sort_values("meta_asof_date").drop_duplicates(subset=["Ticker"], keep="last")
+                save_feather(merged, META_FEATHER)
+                return merged[merged["Ticker"].isin(tickers)].drop_duplicates(subset=["Ticker"]).copy()
+            return cached[cached["Ticker"].isin(tickers)].drop_duplicates(subset=["Ticker"]).copy()
+
+    if force_refresh:
+        print("Forced metadata refresh requested.")
+    else:
+        print(f"Metadata cache stale; refreshing full metadata for {len(tickers)} tickers.")
+
+    meta = fetch_yahoo_metadata(
+        tickers,
+        chunk_size=cfg.meta_chunk_size,
+        sleep_sec=cfg.meta_sleep_sec,
+        max_workers=cfg.meta_max_workers,
+    )
+    meta["meta_asof_date"] = today
+    save_feather(meta, META_FEATHER)
+    return meta
+
+
+def download_close_prices_long(
+    tickers: List[str], start_date: str, end_date: str, chunk_size: int = 100, sleep_sec: float = 0.02
+) -> pd.DataFrame:
+    """Download daily adjusted close prices in chunks and return normalized long-format rows."""
+    long_frames = []
+    for i, chunk in enumerate(chunk_list(tickers, chunk_size), start=1):
+        print(f"Price chunk {i}: {len(chunk)}")
+        try:
+            data = yf.download(
+                tickers=chunk,
+                start=start_date,
+                end=end_date,
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+                group_by="ticker",
+            )
+        except Exception as exc:
+            print(f"  Price failure: {exc}")
+            continue
+        if data is None or data.empty:
+            continue
+
+        if isinstance(data.columns, pd.MultiIndex):
+            for ticker in chunk:
+                if ticker not in data.columns.get_level_values(0):
+                    continue
+                if "Close" not in data[ticker]:
+                    continue
+                s = data[ticker]["Close"].dropna()
+                if s.empty:
+                    continue
+                df = s.to_frame("close").reset_index().rename(columns={"Date": "date"})
+                df["Ticker"] = ticker
+                long_frames.append(df[["date", "Ticker", "close"]])
+        else:
+            if len(chunk) == 1 and "Close" in data.columns:
+                s = data["Close"].dropna()
+                if not s.empty:
+                    df = s.to_frame("close").reset_index().rename(columns={"Date": "date"})
+                    df["Ticker"] = chunk[0]
+                    long_frames.append(df[["date", "Ticker", "close"]])
+        if sleep_sec > 0:
+            time.sleep(sleep_sec)
+
+    if not long_frames:
+        return pd.DataFrame(columns=["date", "Ticker", "close"])
+    out = pd.concat(long_frames, ignore_index=True)
+    out["date"] = pd.to_datetime(out["date"]).dt.normalize()
+    out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    return out.dropna(subset=["close"])
+
 
 #Others----- 
     
