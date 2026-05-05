@@ -40,11 +40,11 @@ Register an account, then use the dashboard to launch stock screening and analys
 └── README.md
 ```
 
-## Developer Setup
+## Local Startup
 
-These instructions will get the project running on any machine with Docker installed.
+These steps boot the project locally with Docker Compose.
 
-**Prerequisites:** Install Docker from [docs.docker.com/get-docker](https://docs.docker.com/get-docker/).
+**Prerequisites:** Install Docker Desktop (or Docker Engine + Compose) from [docs.docker.com/get-docker](https://docs.docker.com/get-docker/).
 
 **1. Clone the repository:**
 
@@ -61,15 +61,25 @@ cp .env.example .env
 
 Then open `.env` and fill in your credentials (see the Environment Variables section below).
 
-**3. Start the web app and database:**
+**3. Start the app from the repository root:**
 
 ```bash
 docker compose up --build
 ```
 
+This builds the local `web` image, starts MongoDB, and launches the Flask app.
+
 The web app will be available at **http://localhost:5001**. Register an account and log in to access the dashboard.
 
-**4. (Optional) Run the stock screener pipeline:**
+**4. Stop the app when you are done:**
+
+Press `Ctrl+C` in the terminal running Compose. To remove the containers afterward, run:
+
+```bash
+docker compose down
+```
+
+**5. (Optional) Run the stock screener pipeline:**
 
 The pipeline is opt-in and runs separately from the web app:
 
@@ -79,7 +89,7 @@ docker compose --profile pipeline run pipeline
 
 This downloads price data, scores stocks, fetches insider activity, and generates research packages. It can take 20–60 minutes depending on your internet connection and machine.
 
-**5. (Optional) Import pipeline output into MongoDB:**
+**6. (Optional) Import pipeline output into MongoDB:**
 
 After the pipeline finishes, seed its output into the database so the web app can display results:
 
@@ -87,29 +97,37 @@ After the pipeline finishes, seed its output into the database so the web app ca
 docker compose --profile seed up mongo_seed
 ```
 
+**7. (Optional) Restart without rebuilding:**
+
+If you already built the images once and only want to start the stack again:
+
+```bash
+docker compose up
+```
+
 ## Environment Variables
 
 Copy `.env.example` to `.env` and fill in the following values:
 
 ```bash
-# Required: OpenAI API key for the AI analyst workflow
+# Required for the AI analyst workflow
 OPENAI_API_KEY=your_openai_api_key_here
 
 # Required: Identifies your app to the SEC EDGAR API (use your real name and email)
 SEC_USER_AGENT=Your Name your_email@example.com
 
-# Required: MongoDB connection string
-# Use the value below when running with Docker Compose (points to the mongodb container)
+# Used by the pipeline and seed tooling
+# When running with Docker Compose, use the local MongoDB service name below
 MONGODB_URI=mongodb://mongodb:27017
 
 # The database name — leave this as-is
 MONGODB_DB_NAME=stocks_app
 
-# Required: Random secret key for Flask session security (generate any long random string)
+# Required: Random secret key for Flask session security
 FLASK_SECRET_KEY=your_random_secret_here
 ```
 
-See `.env.example` in the repository for the full template. `MONGODB_URI` should stay as `mongodb://mongodb:27017` when running locally with Docker Compose — it points to the `mongodb` container by its service name.
+See `.env.example` in the repository for the full template. The analyst code also accepts `OPENAI_KEY`, but `OPENAI_API_KEY` is the preferred variable name. `MONGODB_URI` should stay as `mongodb://mongodb:27017` when running locally with Docker Compose because the containers connect to MongoDB over the Compose network.
 
 ## Running Tests
 
