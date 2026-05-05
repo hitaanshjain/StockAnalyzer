@@ -29,11 +29,11 @@ jobs:
           pip install -r pipeline/requirements.txt
           pip install pytest pytest-cov
 
-      # run the test suite and show which lines aren't covered
+      # run the test suite — fails if coverage drops below 80%
       - name: Run tests
         run: |
           cd web
-          pytest tests/ --cov=. --cov-report=term-missing
+          pytest tests/ --cov=. --cov-report=term-missing --cov-fail-under=80
 
       # only push/deploy on actual pushes, not PRs
       - name: Log in to Docker Hub
