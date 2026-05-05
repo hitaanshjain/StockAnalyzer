@@ -83,7 +83,123 @@ def download_nasdaq_symbol_dirs() -> Tuple[pd.DataFrame, pd.DataFrame]:
     other_txt = requests.get(other_url, timeout=30).text
     # both files are pipe-delimited; parse them into dataframes and return as a pair
     return pd.read_csv(io.StringIO(nasdaq_txt), sep="|"), pd.read_csv(io.StringIO(other_txt), sep="|")
-    lookback_months: int = 8
+#uses the previous funciton to get all the data, then builds a clean dataframe which is now the "stock universe"
+def build_us_common_stock_universe() -> pd.DataFrame:
+    nasdaq_df, other_df = download_nasdaq_symbol_dirs()
+    nasdaq_df = nasdaq_df[nasdaq_df["Symbol"] != "File Creation Time"].copy()
+    other_df = other_df[other_df["ACT Symbol"] != "File Creation Time"].copy()
+
+    nasdaq = pd.DataFrame(
+        {
+            "Ticker": nasdaq_df["Symbol"].astype(str).str.upper().str.strip(),
+            "Company": nasdaq_df["Security Name"].astype(str).str.strip(),
+            "Exchange": "NASDAQ",
+            "ETF": nasdaq_df.get("ETF", "N").astype(str).str.upper().eq("Y"),
+            "TestIssue": nasdaq_df.get("Test Issue", "N").astype(str).str.upper().eq("Y"),
+        }
+    )
+    exchange_map = {"N": "NYSE", "A": "NYSE American", "P": "NYSE Arca", "Z": "BATS", "V": "IEX"}
+    other = pd.DataFrame(
+        {
+            "Ticker": other_df["ACT Symbol"].astype(str).str.upper().str.strip(),
+            "Company": other_df["Security Name"].astype(str).str.strip(),
+            "Exchange": other_df["Exchange"].map(exchange_map).fillna(other_df["Exchange"].astype(str)),
+            "ETF": other_df.get("ETF", "N").astype(str).str.upper().eq("Y"),
+            "TestIssue": other_df.get("Test Issue", "N").astype(str).str.upper().eq("Y"),
+        }
+    )
+    universe = pd.concat([nasdaq, other], ignore_index=True).drop_duplicates(subset=["Ticker"])
+    universe = universe[(~universe["ETF"]) & (~universe["TestIssue"])].copy()
+
+    # The raw exchange lists contain a lot of stuff that trades but is not a plain
+    # common stock. This regex pass is the blunt cleanup layer.
+    exclude_patterns = [
+        r"\bETF\b",
+        r"\bETN\b",
+        r"\bFUND\b",
+        r"\bTRUST\b",
+        r"\bWARRANT\b",
+        r"\bRIGHT\b",
+        r"\bUNIT\b",
+        r"\bPREFERRED\b",
+        r"\bPREF\b",
+        r"\bDEPOSITARY\b",
+        r"\bNOTE\b",
+        r"\bBOND\b",
+        r"\bADR\b",
+        r"\bADS\b",
+        r"\bLP\b",
+        r"\bL\.P\.\b",
+        r"\bLIMITED PARTNERSHIP\b",
+        r"\bACQUISITION\b",
+        r"\bSPAC\b",
+    ]
+    pattern = "|".join(exclude_patterns)
+    universe = universe[~universe["Company"].str.upper().str.contains(pattern, regex=True, na=False)].copy()
+    universe = universe[~universe["Ticker"].str.contains(r"[\^\$]", regex=True, na=False)].copy()
+    return universe.reset_index(drop=True)
+
+#This function takes a list of tickers, and retrieves metadata of those tickers/stocks from Yahoo finnace
+#(e.g. ticker, market_cap_num, sector, industry, etc.)
+#splits the list into chunks and batches them and runs the reequests concurrently using threads so it is faster and also won't overwhelm the api/website.
+#returns a pandas dataframe where each row is one ticker and each column is a piece of metadata. 
+#The reason we need this function is because the Nasdaq symbol list only gives you symbols, not enough info to actually screen
+def fetch_yahoo_metadata(
+    tickers: List[str], chunk_size: int = 150, sleep_sec: float = 0.05, max_workers: int = 4
+) -> pd.DataFrame:
+    def _fetch_chunk(chunk_items: List[str], chunk_idx: int) -> List[dict]:
+        print(f"Metadata chunk {chunk_idx}: {len(chunk_items)}")
+        local_rows: List[dict] = []
+        try:
+            tq = Ticker(chunk_items, asynchronous=True, validate=True)
+            price_data = tq.price
+            profiles = tq.summary_profile
+        except Exception as exc:
+            print(f"  Metadata failure (chunk {chunk_idx}): {exc}")
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+            return local_rows
+
+        for ticker in chunk_items:
+            p = price_data.get(ticker, {}) if isinstance(price_data, dict) else {}
+            sp = profiles.get(ticker, {}) if isinstance(profiles, dict) else {}
+            if not isinstance(p, dict):
+                p = {}
+            if not isinstance(sp, dict):
+                sp = {}
+            local_rows.append(
+                {
+                    "Ticker": ticker,
+                    "market_cap_num": p.get("marketCap", np.nan),
+                    "quoteType": p.get("quoteType"),
+                    "exchangeName": p.get("exchangeName"),
+                    "shortName": p.get("shortName"),
+                    "regularMarketPrice": p.get("regularMarketPrice", np.nan),
+                    "sector": sp.get("sector"),
+                    "industry": sp.get("industry"),
+                }
+            )
+        if sleep_sec > 0:
+            time.sleep(sleep_sec)
+        return local_rows
+
+    rows: List[dict] = []
+    chunks = list(chunk_list(tickers, chunk_size))
+    worker_count = min(max_workers, max(1, len(chunks)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(_fetch_chunk, chunk, idx) for idx, chunk in enumerate(chunks, start=1)]
+        for future in as_completed(futures):
+            rows.extend(future.result())
+
+    meta = pd.DataFrame(rows).drop_duplicates(subset=["Ticker"])
+    if meta.empty:
+        return meta
+    meta["market_cap_num"] = pd.to_numeric(meta["market_cap_num"], errors="coerce")
+    meta["regularMarketPrice"] = pd.to_numeric(meta["regularMarketPrice"], errors="coerce")
+    return meta
+
+#Others----- 
+    
 
 def quadratic_log_fit_r2(price_series: pd.Series) -> Tuple[float, float]:
     s = pd.Series(price_series).dropna().copy()
