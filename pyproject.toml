@@ -15,10 +15,10 @@ testpaths = [
 [tool.coverage.run]
 omit = [
   "*/tests/*",
-  "pipeline/run_pipeline.py",
-  "pipeline/stocks.py",
-  "pipeline/agent_workflow.py",
-  "web/app.py",
+  "*/run_pipeline.py",
+  "*/stocks.py",
+  "*/agent_workflow.py",
+  "*/app.py",
 ]
 
 [tool.coverage.report]
