@@ -13,10 +13,18 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
+
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-
+import yfinance as yf
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from scipy.stats import linregress
+from tqdm.auto import tqdm
+from yahooquery import Ticker
+from mongo_store import get_mongo_store
 
 
 warnings.filterwarnings("ignore")  # suppress noisy deprecation warnings
@@ -199,17 +207,23 @@ def fetch_yahoo_metadata(
     return meta
 def update_metadata_cache(raw_universe: pd.DataFrame, cfg: PipelineConfig, force_refresh: bool = False) -> pd.DataFrame:
     """Return universe metadata from cache when fresh, backfilling only missing tickers when needed."""
+    # Normalize "today" so age checks are done in whole days, not wall-clock hours.
     today = pd.Timestamp.now().normalize()
+    # Canonical ticker format prevents case/whitespace mismatches during cache joins.
     tickers = raw_universe["Ticker"].dropna().astype(str).str.upper().tolist()
     cached = load_feather(META_FEATHER)
 
+    # Fast path: only use cache when refresh is not forced and required cache fields are present.
     if (not force_refresh) and cached is not None and not cached.empty and "meta_asof_date" in cached.columns:
+        # Coerce dates defensively so malformed rows don't break freshness checks.
         cached["meta_asof_date"] = pd.to_datetime(cached["meta_asof_date"], errors="coerce").dt.normalize()
         latest_asof = cached["meta_asof_date"].max()
         cached_tickers = set(cached["Ticker"].dropna().astype(str).str.upper())
+        # Treat missing/invalid asof dates as very old so we refresh safely.
         age_days = (today - latest_asof).days if pd.notna(latest_asof) else 99999
         missing = sorted(set(tickers) - cached_tickers)
 
+        # Cache is fresh and complete for requested tickers.
         if age_days <= cfg.metadata_refresh_days and not missing:
             print(
                 f"Metadata cache age {age_days} day(s) <= {cfg.metadata_refresh_days}; "
@@ -230,11 +244,13 @@ def update_metadata_cache(raw_universe: pd.DataFrame, cfg: PipelineConfig, force
                 max_workers=cfg.meta_max_workers,
             )
             if not meta_missing.empty:
+                # Stamp new rows, merge, and keep newest record per ticker.
                 meta_missing["meta_asof_date"] = today
                 merged = pd.concat([cached, meta_missing], ignore_index=True)
                 merged = merged.sort_values("meta_asof_date").drop_duplicates(subset=["Ticker"], keep="last")
                 save_feather(merged, META_FEATHER)
                 return merged[merged["Ticker"].isin(tickers)].drop_duplicates(subset=["Ticker"]).copy()
+            # If Yahoo returns nothing for missing symbols, keep serving the cached subset.
             return cached[cached["Ticker"].isin(tickers)].drop_duplicates(subset=["Ticker"]).copy()
 
     if force_refresh:
@@ -242,6 +258,7 @@ def update_metadata_cache(raw_universe: pd.DataFrame, cfg: PipelineConfig, force
     else:
         print(f"Metadata cache stale; refreshing full metadata for {len(tickers)} tickers.")
 
+    # Slow path: refresh full metadata snapshot and overwrite cache.
     meta = fetch_yahoo_metadata(
         tickers,
         chunk_size=cfg.meta_chunk_size,
@@ -258,6 +275,7 @@ def download_close_prices_long(
 ) -> pd.DataFrame:
     """Download daily adjusted close prices in chunks and return normalized long-format rows."""
     long_frames = []
+    # Download in chunks to reduce request size and transient Yahoo failures.
     for i, chunk in enumerate(chunk_list(tickers, chunk_size), start=1):
         print(f"Price chunk {i}: {len(chunk)}")
         try:
@@ -274,9 +292,11 @@ def download_close_prices_long(
         except Exception as exc:
             print(f"  Price failure: {exc}")
             continue
+        # Skip empty payloads and continue with remaining chunks.
         if data is None or data.empty:
             continue
 
+        # MultiIndex is the normal shape for multi-ticker downloads.
         if isinstance(data.columns, pd.MultiIndex):
             for ticker in chunk:
                 if ticker not in data.columns.get_level_values(0):
@@ -290,6 +310,7 @@ def download_close_prices_long(
                 df["Ticker"] = ticker
                 long_frames.append(df[["date", "Ticker", "close"]])
         else:
+            # Single ticker downloads can come back as a flat column frame.
             if len(chunk) == 1 and "Close" in data.columns:
                 s = data["Close"].dropna()
                 if not s.empty:
@@ -297,19 +318,132 @@ def download_close_prices_long(
                     df["Ticker"] = chunk[0]
                     long_frames.append(df[["date", "Ticker", "close"]])
         if sleep_sec > 0:
+            # Optional throttle to stay friendly with upstream endpoints.
             time.sleep(sleep_sec)
 
     if not long_frames:
+        # Preserve schema for downstream joins/pivots even when no data was fetched.
         return pd.DataFrame(columns=["date", "Ticker", "close"])
     out = pd.concat(long_frames, ignore_index=True)
+    # Final normalization keeps timestamps and identifiers consistent across chunks.
     out["date"] = pd.to_datetime(out["date"]).dt.normalize()
     out["Ticker"] = out["Ticker"].astype(str).str.upper().str.strip()
     out["close"] = pd.to_numeric(out["close"], errors="coerce")
     return out.dropna(subset=["close"])
 
+def save_feather(df: pd.DataFrame, path: Path) -> None:
+    # Ensure destination folders exist before writing the feather file.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Persist a clean, contiguous index to avoid saving stale row labels.
+    df.reset_index(drop=True).to_feather(path)
 
-#Others----- 
-    
+
+def load_feather(path: Path) -> Optional[pd.DataFrame]:
+    # Missing cache file is a normal case; return None so caller can rebuild it.
+    if not path.exists():
+        return None
+    # Load and return cached dataframe when present.
+    return pd.read_feather(path)
+
+
+def get_latest_market_trading_day() -> pd.Timestamp:
+    """
+    Infer latest US market trading day from recent SPY bars.
+    Falls back to previous business day on fetch issues.
+    """
+    today = pd.Timestamp.now().normalize()
+    try:
+        # Use recent SPY daily bars as a proxy for the most recent US market session.
+        spy = yf.download(
+            tickers="SPY",
+            period="10d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+        if spy is not None and not spy.empty:
+            idx = pd.to_datetime(spy.index).normalize()
+            return pd.Timestamp(idx.max())
+    except Exception:
+        # If Yahoo probe fails, fall back to a business-day approximation.
+        pass
+
+    # Fallback if market probe fails.
+    if today.weekday() >= 5:
+        return today - pd.offsets.BDay(1)
+    return today
+
+
+def update_price_cache(universe_meta: pd.DataFrame, cfg: PipelineConfig) -> pd.DataFrame:
+    today = pd.Timestamp.now().normalize()
+    latest_market_day = get_latest_market_trading_day()
+    cached = load_feather(PRICE_FEATHER)
+
+    if cached is not None and not cached.empty:
+        # Normalize dates for reliable comparisons across timezone/localization differences.
+        cached["date"] = pd.to_datetime(cached["date"]).dt.normalize()
+        most_recent = cached["date"].max()
+        print(f"Cache exists; latest cached date: {most_recent.date()} | latest market day: {latest_market_day.date()}")
+        if most_recent >= latest_market_day:
+            print("Cache is already up-to-date for the latest market trading day; using cached prices.")
+            return cached
+        # The +1 day on the end date is intentional: Yahoo's end date is effectively exclusive.
+        # So we start the next fetch at the day after the last cached row.
+        fetch_start = (most_recent + timedelta(days=1)).strftime("%Y-%m-%d")
+        print(
+            f"Fetching incremental prices only from {fetch_start} to {(latest_market_day + timedelta(days=1)).date()}"
+        )
+    else:
+        # No cache yet: bootstrap a full lookback window from config.
+        cached = pd.DataFrame(columns=["date", "Ticker", "close"])
+        fetch_start = (today - pd.DateOffset(years=cfg.universe_history_years)).strftime("%Y-%m-%d")
+        print(f"No cache found; fetching full history from {fetch_start}")
+
+    # Fetch only for tickers currently in the eligible universe.
+    tickers = sorted(universe_meta["Ticker"].dropna().unique().tolist())
+    new_prices = download_close_prices_long(
+        tickers=tickers,
+        start_date=fetch_start,
+        end_date=(latest_market_day + timedelta(days=1)).strftime("%Y-%m-%d"),
+        chunk_size=cfg.download_chunk_size,
+        sleep_sec=cfg.price_sleep_sec,
+    )
+
+    # Merge cache + new rows, keeping the newest value per (date, ticker).
+    merged = pd.concat([cached, new_prices], ignore_index=True)
+    merged = merged.drop_duplicates(subset=["date", "Ticker"], keep="last")
+    merged = merged.sort_values(["date", "Ticker"]).reset_index(drop=True)
+    save_feather(merged, PRICE_FEATHER)
+    return merged
+
+
+def safe_ratio(recent: float, old: float, clip_min: float = 0.05, clip_max: float = 10.0) -> float:
+    # Preserve NaN semantics when either side is missing.
+    if pd.isna(recent) or pd.isna(old):
+        return np.nan
+
+    # Guard denominators against near-zero explosions before division.
+    recent_adj = max(float(recent), clip_min)
+    old_adj = max(float(old), clip_min)
+    ratio = recent_adj / old_adj
+
+    # Clip ratio to a bounded range so outliers cannot dominate downstream scores.
+    return min(max(ratio, 1 / clip_max), clip_max)
+
+
+def trend_to_noise_ratio(price_series: pd.Series) -> float:
+    # Clean and validate series before any log-return math.
+    s = pd.Series(price_series).dropna().copy()
+    if len(s) < 3:
+        return np.nan
+    if s.iloc[0] <= 0 or s.iloc[-1] <= 0:
+        return np.nan
+
+    # Trend quality = net directional move divided by total path volatility.
+    log_ret = np.log(s / s.shift(1)).dropna()
+    if len(log_ret) == 0:
+        return np.nan
 
 def quadratic_log_fit_r2(price_series: pd.Series) -> Tuple[float, float]:
     s = pd.Series(price_series).dropna().copy()
