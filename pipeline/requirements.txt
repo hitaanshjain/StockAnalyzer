@@ -1,5 +1,5 @@
 # Pipeline dependencies
-numpy
+numpy<2
 pandas
 scipy
 scikit-learn
