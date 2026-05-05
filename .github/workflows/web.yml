@@ -80,5 +80,6 @@ jobs:
             echo "SEC_USER_AGENT=${{ secrets.SEC_USER_AGENT }}" >> .env
             echo "MONGODB_DB_NAME=stocks_app" >> .env
             echo "FLASK_SECRET_KEY=${{ secrets.FLASK_SECRET_KEY }}" >> .env
+            echo "DOCKERHUB_USERNAME=${{ secrets.DOCKERHUB_USERNAME }}" >> .env
             docker compose pull
             docker compose up -d mongodb web
