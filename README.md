@@ -8,7 +8,6 @@ An end-to-end equity research platform that combines quantitative screening, ins
 
 ## Live Demo + Screenshots
 
-- Live app: http://204.48.16.73:5001
 - Repository: https://github.com/hitaanshjain/StockAnalyzer
 
 ![Login and onboarding flow](docs/media/login.png)
@@ -33,8 +32,6 @@ I implemented a three-service system that turns market data into an interactive 
 - A Mongo-backed persistence layer and import tooling for pipeline output and web consumption.
 
 ## My Contributions
-
-This repository was built as a team project, and my portfolio focus is on the parts I directly owned and integrated:
 
 - Built core web app features in Flask, including auth flow, dashboard interactions, job launch UX, and result rendering.
 - Designed and integrated MongoDB data models/collections to persist screening runs, analysis jobs, and result payloads.
