@@ -1,32 +1,142 @@
 # Stock Research Platform
 
-![Web CI/CD](https://github.com/swe-students-spring2026/5-final-lakers_in_five/actions/workflows/web.yml/badge.svg)
-![Pipeline CI/CD](https://github.com/swe-students-spring2026/5-final-lakers_in_five/actions/workflows/pipeline.yml/badge.svg)
-![Mongo Service CI/CD](https://github.com/swe-students-spring2026/5-final-lakers_in_five/actions/workflows/mongo_service.yml/badge.svg)
+![Web CI/CD](https://github.com/hitaanshjain/StockAnalyzer/actions/workflows/web.yml/badge.svg)
+![Pipeline CI/CD](https://github.com/hitaanshjain/StockAnalyzer/actions/workflows/pipeline.yml/badge.svg)
+![Mongo Service CI/CD](https://github.com/hitaanshjain/StockAnalyzer/actions/workflows/mongo_service.yml/badge.svg)
 
-A full-stack stock research platform that screens U.S. equities using momentum and insider-buying signals, generates AI-powered analyst writeups, and presents everything through a web dashboard backed by MongoDB.
+An end-to-end equity research platform that combines quantitative screening, insider-trading signals, and AI-generated analysis in a production-style web workflow.
 
-## What It Does
+## Live Demo + Screenshots
 
-The platform has two main workflows. First, the **screener pipeline** builds a universe of U.S. common stocks, scores each one using an 8-month momentum model and recent insider purchase activity, and produces a ranked list with charts and SEC filing summaries. Second, the **AI analyst** reads those research packages and writes structured reports that evaluate whether a stock's recent move looks like a real but still-incomplete repricing.
+- Live app: http://204.48.16.73:5001
+- Repository: https://github.com/hitaanshjain/StockAnalyzer
 
-The **web app** ties it together: register an account, pick a rank range from the screener, launch an analysis job, watch the live log output, and read the stored results — all from the browser.
+![Login and onboarding flow](docs/media/login.png)
+![Dashboard and job launch](docs/media/dashboard.png)
+![Generated analysis results](docs/media/results.png)
 
-## Subsystems
+## Why This Matters
 
-| Subsystem | Description | Docker Image |
-|-----------|-------------|--------------|
-| `web/` | Flask app, HTML templates, authentication, job management | [stocks-web on Docker Hub](https://hub.docker.com/r/tx715/stocks-web) |
-| `pipeline/` | Stock screener, momentum scoring, insider data, AI analyst workflow | [stocks-pipeline on Docker Hub](https://hub.docker.com/r/tx715/stocks-pipeline) |
-| `mongo_service/` | MongoDB helper utilities, data seeding, import tooling | [swe-mongo-service on Docker Hub](https://hub.docker.com/r/tx715/swe-mongo-service) |
+Retail investors often see momentum moves but do not have a reliable way to quickly separate hype from signal. This project helps users move from raw market noise to structured decision support by combining price action, insider activity, and explainable AI-generated research summaries.
 
-## Live App
+Primary users:
 
-The app is deployed and running at:
+- Individual investors who want a faster first-pass research workflow.
+- Data-oriented users who want reproducible screening logic before deeper due diligence.
 
-**http://204.48.16.73:5001**
+## What I Built
 
-Register an account, then use the dashboard to launch stock screening and analysis jobs.
+I implemented a three-service system that turns market data into an interactive analysis experience:
+
+- A Flask web app with authentication, job submission, live run logs, and persisted result views.
+- A screening pipeline that builds a U.S. stock universe, ranks candidates, and assembles research packages.
+- A Mongo-backed persistence layer and import tooling for pipeline output and web consumption.
+
+## My Contributions
+
+This repository was built as a team project, and my portfolio focus is on the parts I directly owned and integrated:
+
+- Built core web app features in Flask, including auth flow, dashboard interactions, job launch UX, and result rendering.
+- Designed and integrated MongoDB data models/collections to persist screening runs, analysis jobs, and result payloads.
+- Implemented web-to-MongoDB data flow so user-triggered jobs are stored reliably and surfaced in the dashboard.
+
+## Architecture Diagram + Data Flow
+
+```mermaid
+flowchart LR
+	U[User] --> W[Flask Web App]
+	W --> M[(MongoDB)]
+	W --> P[Pipeline Job Runner]
+	P --> D[Market + Insider Data Sources]
+	P --> A[AI Analyst Workflow]
+	A --> O[Research Outputs]
+	O --> M
+	M --> W
+```
+
+Data flow summary:
+
+1. User starts a screening/analysis job from the web dashboard.
+2. Pipeline collects market and insider data, computes rankings, and builds research packages.
+3. AI analyst stage generates structured writeups from package inputs.
+4. Outputs are persisted in MongoDB and surfaced back in the web UI.
+
+## Key Technical Challenges and Tradeoffs
+
+- Data source reliability vs coverage: External APIs and public endpoints can be noisy; the system favors retryable workflows and reruns over brittle hard-fail behavior.
+- Throughput vs freshness: End-to-end analysis can be compute/network heavy, so the pipeline prioritizes deterministic batch runs over real-time tick updates.
+- Explainability vs model depth: AI summaries are structured and readable for decision support, while final investment decisions still require manual validation.
+
+## Reliability and Performance Notes
+
+- Automated tests cover service-level behavior for web, pipeline, and Mongo modules.
+- CI pipelines run reliability gates on every push/PR to catch regressions early.
+- Service-specific Docker images are built and published, enabling reproducible deployments.
+- Web deployment is automated so validated changes can be promoted with confidence.
+
+Run tests locally:
+
+```bash
+pip install pytest pytest-cov
+pytest mongo_service/tests pipeline/tests web/tests --cov=. --cov-report=term-missing
+```
+
+## Future Improvements
+
+- Add asynchronous job queueing (Celery/RQ) to support concurrent analysis requests.
+- Expand explainability with factor-level attribution and confidence scoring.
+- Add historical backtesting and paper-trading style validation for strategy drift checks.
+- Introduce role-based access controls and audit trails for multi-user production usage.
+
+## Quickstart
+
+Prerequisites: Docker Desktop (or Docker Engine + Compose).
+
+1. Clone the repository.
+
+```bash
+git clone https://github.com/hitaanshjain/StockAnalyzer.git
+cd StockAnalyzer
+```
+
+2. Create environment file.
+
+```bash
+cp .env.example .env
+```
+
+3. Add required variables to `.env`:
+
+```bash
+OPENAI_API_KEY=your_openai_api_key_here
+SEC_USER_AGENT=Your Name your_email@example.com
+MONGODB_URI=mongodb://mongodb:27017
+MONGODB_DB_NAME=stocks_app
+FLASK_SECRET_KEY=your_random_secret_here
+```
+
+4. Build and start services.
+
+```bash
+docker compose up --build
+```
+
+5. Open the app.
+
+- http://localhost:5001
+
+Optional pipeline and import runs:
+
+```bash
+docker compose --profile pipeline run pipeline
+docker compose --profile seed up mongo_seed
+```
+
+Stop services:
+
+```bash
+docker compose down
+```
 
 ## Repository Layout
 
@@ -36,135 +146,6 @@ Register an account, then use the dashboard to launch stock screening and analys
 ├── pipeline/             # Stock screener and AI analyst
 ├── mongo_service/        # MongoDB helpers and seed tooling
 ├── docker-compose.yml    # Orchestrates all services
-├── .env.example          # Template for required environment variables
+├── .env.example          # Environment variable template
 └── README.md
 ```
-
-## Local Startup
-
-These steps boot the project locally with Docker Compose.
-
-**Prerequisites:** Install Docker Desktop (or Docker Engine + Compose) from [docs.docker.com/get-docker](https://docs.docker.com/get-docker/).
-
-**1. Clone the repository:**
-
-```bash
-git clone https://github.com/swe-students-spring2026/5-final-lakers_in_five.git
-cd 5-final-lakers_in_five
-```
-
-**2. Create your `.env` file:**
-
-```bash
-cp .env.example .env
-```
-
-Then open `.env` and fill in your credentials (see the Environment Variables section below).
-
-**3. Start the app from the repository root:**
-
-```bash
-docker compose up --build
-```
-
-This builds the local `web` image, starts MongoDB, and launches the Flask app.
-
-The web app will be available at **http://localhost:5001**. Register an account and log in to access the dashboard.(If the link gereated on your terminal get access denied - > go to your local 5001)
-
-**4. Stop the app when you are done:**
-
-Press `Ctrl+C` in the terminal running Compose. To remove the containers afterward, run:
-
-```bash
-docker compose down
-```
-
-**5. (Optional) Run the stock screener pipeline:**
-
-The pipeline is opt-in and runs separately from the web app:
-
-```bash
-docker compose --profile pipeline run pipeline
-```
-
-This downloads price data, scores stocks, fetches insider activity, and generates research packages. It can take 20–60 minutes depending on your internet connection and machine.
-
-**6. (Optional) Import pipeline output into MongoDB:**
-
-After the pipeline finishes, seed its output into the database so the web app can display results:
-
-```bash
-docker compose --profile seed up mongo_seed
-```
-
-**7. (Optional) Restart without rebuilding:**
-
-If you already built the images once and only want to start the stack again:
-
-```bash
-docker compose up
-```
-
-## Environment Variables
-
-Copy `.env.example` to `.env` and fill in the following values:
-
-```bash
-# Required for the AI analyst workflow
-OPENAI_API_KEY=your_openai_api_key_here
-
-# Required: Identifies your app to the SEC EDGAR API (use your real name and email)
-SEC_USER_AGENT=Your Name your_email@example.com
-
-# Used by the pipeline and seed tooling
-# When running with Docker Compose, use the local MongoDB service name below
-MONGODB_URI=mongodb://mongodb:27017
-
-# The database name — leave this as-is
-MONGODB_DB_NAME=stocks_app
-
-# Required: Random secret key for Flask session security
-FLASK_SECRET_KEY=your_random_secret_here
-```
-
-See `.env.example` in the repository for the full template. The analyst code also accepts `OPENAI_KEY`, but `OPENAI_API_KEY` is the preferred variable name. `MONGODB_URI` should stay as `mongodb://mongodb:27017` when running locally with Docker Compose because the containers connect to MongoDB over the Compose network.
-
-## Running Tests
-
-Install test dependencies and run all tests across all three subsystems:
-
-```bash
-pip install pytest pytest-cov
-pytest mongo_service/tests pipeline/tests web/tests --cov=. --cov-report=term-missing
-```
-
-Each subsystem's CI workflow enforces at least 80% code coverage.
-
-## CI/CD
-
-Every push or pull request to `main` triggers the GitHub Actions workflows. Each subsystem has its own workflow that independently builds, tests, and pushes its Docker image to Docker Hub. The `web` workflow also deploys the latest image to Digital Ocean automatically.
-
-## Generated Output
-
-The following directories are created at runtime and are not committed to the repository:
-
-- `data/` — price and metadata caches
-- `screening_output/` — screener results and charts
-- `agents_data_package/` — per-ticker research packages
-- `output/` — final pipeline output
-
-## Live Analysis Note
-
-If an error appears in the live output during an analysis run, it is usually a transient scraping or upstream data-fetch issue (Yahoo Finance, OpenInsider, or SEC EDGAR). The overall system is still healthy — it is generally safe to rerun the job.
-
-## GitHub
-
-[github.com/swe-students-spring2026/5-final-lakers_in_five](https://github.com/swe-students-spring2026/5-final-lakers_in_five)
-
-## Developers
-
-- [Blake Chang](https://github.com/louisvcarpet)
-- [Peter Ma](https://github.com/pjm9792-ui)
-- [Tao Xie](https://github.com/tx715)
-- [Sarya Sadi](https://github.com/saryassadi)
-- [Hitaansh Jain](https://github.com/hitaanshjain)
